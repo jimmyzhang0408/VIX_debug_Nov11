@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# Exported runtime logs/results
+exports_206/
+*.log

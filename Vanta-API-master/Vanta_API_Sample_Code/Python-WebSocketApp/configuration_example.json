@@ -1,0 +1,14 @@
+{
+	"connection" : "",
+	"host" : "10.163.210.80",
+	"port" : "7860",
+	"controller" : true,
+	"exit_headless": true,
+	"watchdog"	: true,
+	"repeat_count": 5000,
+	"repeat_sleep": 0,
+	"repeat_calcheck": false,
+	"auto_login" : true,
+	"username" : "Administrator",
+	"password" : "0000",
+}
