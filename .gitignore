@@ -14,3 +14,8 @@ __pycache__/
 # Exported runtime logs/results
 exports_206/
 *.log
+/runtime/
+
+# PyInstaller output
+/build/
+/dist/
