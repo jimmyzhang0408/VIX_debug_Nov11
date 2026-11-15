@@ -31,3 +31,7 @@ DEMO 台架使用 Arduino UNO R4 WiFi。固件和五根线的接线表在同一�
 打开 `dist/VantaListener/VantaListener.exe`。交付时请复制整个 `VantaListener` 目录，并保留 `_internal`。源码运行时，程序把日志和结果写到仓库根目录的 `runtime`。EXE 运行时，程序把它们写到 EXE 旁边的 `runtime`。
 
 [Vanta iX API 命令列表](Vanta-API-master/Vanta_API_Documents/API-Command-List.md)
+
+## 待修改计划
+
+漏检 / 漏发判定相关的完整修改清单见 [docs/MODIFICATION_PLAN.md](docs/MODIFICATION_PLAN.md)。
