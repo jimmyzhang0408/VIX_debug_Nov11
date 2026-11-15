@@ -14,6 +14,8 @@ constexpr uint32_t kReportIntervalMs = 1000;
 constexpr uint32_t kFaultBlinkHalfPeriodMs = 500;
 constexpr uint32_t kReadyHoldMs = 2000;
 constexpr uint32_t kStartPulseMs = 100;
+constexpr uint32_t kStartAckTimeoutMs = 3000;
+constexpr uint32_t kReadyReturnTimeoutMs = 300000;
 constexpr uint32_t kDoubleStartShortGapMs = 500;
 constexpr uint32_t kDoubleStartDefaultGapMs = 1000;
 
@@ -40,8 +42,15 @@ struct TriggerCycle {
   uint32_t sent = 0;
   uint32_t phaseSince = 0;
   uint32_t inputRevision = 0;
+  uint32_t pulseAtMs = 0;
   uint32_t readyDropsAtStart = 0;
+  uint32_t radOnRisesAtStart = 0;
+  uint32_t ackedAtMs = 0;
+  uint32_t noResponse = 0;
+  uint32_t radOnCycles = 0;
   uint32_t doubleGapMs = 0;
+  bool acked = false;
+  bool sawRadOn = false;
 };
 
 struct InputSample {
@@ -49,6 +58,7 @@ struct InputSample {
   bool faultLocked;
   uint32_t revision;
   uint32_t readyDrops;
+  uint32_t radOnRises;
   uint32_t timeMs;
 };
 
@@ -66,6 +76,7 @@ volatile uint32_t sequence = 0;
 volatile uint32_t droppedChanges = 0;
 volatile uint32_t inputRevision = 0;
 volatile uint32_t readyDrops = 0;
+volatile uint32_t radOnRises = 0;
 volatile bool faultLocked = false;
 
 TriggerCycle cycle;
@@ -84,6 +95,9 @@ void captureLevel(uint8_t signal, bool active) {
   inputState ^= signal;
   if (signal == kReady && !active) {
     ++readyDrops;
+  }
+  if (signal == kRadOn && active) {
+    ++radOnRises;
   }
   if (signal == kFault && active) {
     faultOnMs = now;
@@ -149,7 +163,7 @@ InputSample sampleInputs() {
   } else {
     captureLevel(kFault, faultActive);
   }
-  const InputSample sample = {inputState, faultLocked, inputRevision, readyDrops, millis()};
+  const InputSample sample = {inputState, faultLocked, inputRevision, readyDrops, radOnRises, millis()};
   interrupts();
   return sample;
 }
@@ -181,9 +195,46 @@ void printCycle(const char* event) {
   }
 }
 
+void printTrigger() {
+  char line[96];
+  const int length = snprintf(
+      line, sizeof(line), "CTRL TRIGGER sent=%lu total=%lu t_ms=%lu\r\n",
+      static_cast<unsigned long>(cycle.sent), static_cast<unsigned long>(cycle.requested),
+      static_cast<unsigned long>(cycle.pulseAtMs));
+  if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+    Serial.write(reinterpret_cast<uint8_t*>(line), static_cast<size_t>(length));
+  }
+}
+
+void printCycleResult(const char* event, uint32_t elapsedMs) {
+  char line[112];
+  const int length = snprintf(
+      line, sizeof(line), "CTRL %s sent=%lu total=%lu rad_on=%d ms=%lu\r\n",
+      event, static_cast<unsigned long>(cycle.sent), static_cast<unsigned long>(cycle.requested),
+      cycle.sawRadOn, static_cast<unsigned long>(elapsedMs));
+  if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+    Serial.write(reinterpret_cast<uint8_t*>(line), static_cast<size_t>(length));
+  }
+}
+
+void printSummary() {
+  char line[112];
+  const int length = snprintf(
+      line, sizeof(line), "CTRL SUMMARY sent=%lu total=%lu no_response=%lu rad_on_cycles=%lu\r\n",
+      static_cast<unsigned long>(cycle.sent), static_cast<unsigned long>(cycle.requested),
+      static_cast<unsigned long>(cycle.noResponse), static_cast<unsigned long>(cycle.radOnCycles));
+  if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+    Serial.write(reinterpret_cast<uint8_t*>(line), static_cast<size_t>(length));
+  }
+}
+
 void endCycle(const char* event) {
   releaseStart();
+  const CyclePhase phase = cycle.phase;
   cycle.phase = CyclePhase::Idle;
+  if (phase != CyclePhase::Idle && !doubleStartActive(phase)) {
+    printSummary();
+  }
   printCycle(event);
 }
 
@@ -192,6 +243,36 @@ void beginReadyHold(const InputSample& sample) {
   cycle.phaseSince = sample.timeMs;
   cycle.inputRevision = sample.revision;
   printCycle("READY_HOLD");
+}
+
+bool eligibleToStart(const InputSample& sample) {
+  return !sample.faultLocked && sample.active == kReady;
+}
+
+void finishOrNext(const InputSample& sample) {
+  if (cycle.sent == cycle.requested) {
+    endCycle("DONE");
+  } else if (eligibleToStart(sample)) {
+    beginReadyHold(sample);
+  } else {
+    cycle.phase = CyclePhase::WaitReady;
+    printCycle("WAIT_READY");
+  }
+}
+
+void recordResponse(const InputSample& sample) {
+  if (cycle.phase != CyclePhase::Pulse && cycle.phase != CyclePhase::WaitReturn) {
+    return;
+  }
+  const bool radRose = sample.radOnRises != cycle.radOnRisesAtStart;
+  if (!cycle.acked && (radRose || sample.readyDrops != cycle.readyDropsAtStart)) {
+    cycle.acked = true;
+    cycle.ackedAtMs = sample.timeMs;
+  }
+  if (radRose && !cycle.sawRadOn) {
+    cycle.sawRadOn = true;
+    ++cycle.radOnCycles;
+  }
 }
 
 void updateDoubleStart(uint32_t now) {
@@ -230,6 +311,7 @@ void updateCycle() {
     updateDoubleStart(sample.timeMs);
     return;
   }
+  recordResponse(sample);
   if (sample.faultLocked) {
     if (cycle.phase != CyclePhase::Idle) {
       endCycle("FAULT_STOPPED");
@@ -241,7 +323,7 @@ void updateCycle() {
     return;
   }
 
-  const bool eligible = (sample.active & (kReady | kRadOn | kFault)) == kReady;
+  const bool eligible = eligibleToStart(sample);
   switch (cycle.phase) {
     case CyclePhase::Idle:
       break;
@@ -259,13 +341,18 @@ void updateCycle() {
       if (sample.timeMs - cycle.phaseSince >= kReadyHoldMs) {
         if (!assertStart(sample)) {
           cycle.phase = CyclePhase::WaitReady;
+          printCycle("START_BLOCKED");
           break;
         }
         cycle.phaseSince = millis();
+        cycle.pulseAtMs = cycle.phaseSince;
         cycle.readyDropsAtStart = sample.readyDrops;
+        cycle.radOnRisesAtStart = sample.radOnRises;
+        cycle.acked = false;
+        cycle.sawRadOn = false;
         cycle.phase = CyclePhase::Pulse;
         ++cycle.sent;
-        printCycle("TRIGGER");
+        printTrigger();
       }
       break;
     case CyclePhase::Pulse:
@@ -275,17 +362,21 @@ void updateCycle() {
         printCycle("WAIT_READY_RETURN");
       }
       break;
-    case CyclePhase::WaitReturn:
-      // A new READY withdrawal must follow this pulse before the next one.
-      if (sample.readyDrops == cycle.readyDropsAtStart || !eligible) {
-        break;
-      }
-      if (cycle.sent == cycle.requested) {
-        endCycle("DONE");
-      } else {
-        beginReadyHold(sample);
+    case CyclePhase::WaitReturn: {
+      const uint32_t sincePulse = sample.timeMs - cycle.pulseAtMs;
+      if (!cycle.acked && sincePulse >= kStartAckTimeoutMs) {
+        ++cycle.noResponse;
+        printCycleResult("NO_RESPONSE", sincePulse);
+        finishOrNext(sample);
+      } else if (cycle.acked && eligible) {
+        printCycleResult("CYCLE_END", sincePulse);
+        finishOrNext(sample);
+      } else if (cycle.acked && sample.timeMs - cycle.ackedAtMs >= kReadyReturnTimeoutMs) {
+        printCycleResult("READY_RETURN_TIMEOUT", sincePulse);
+        endCycle("STOPPED");
       }
       break;
+    }
     default:
       break;
   }
@@ -408,6 +499,7 @@ void handleCommand(char* line) {
       requestCycle(count);
     }
   } else if (strcmp(verb, "STOP") == 0 && argument == nullptr) {
+    recordResponse(sampleInputs());
     endCycle("STOPPED");
   } else if (strcmp(verb, "CLEAR") == 0 && argument != nullptr && strcmp(argument, "FAULT") == 0) {
     clearFaultLock();

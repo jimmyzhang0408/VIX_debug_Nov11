@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import importlib
 import queue
@@ -16,8 +16,11 @@ MAX_REPORT_BYTES = 256
 MAX_CONSOLE_LINE_BYTES = 2048
 MAX_COMMAND_BYTES = 39
 REPORT_EVENTS = frozenset(("BOOT", "STATE", "READY", "RAD_ON", "FAULT"))
-CONTROL_PROGRESS = re.compile(r"CTRL ([A-Z_]+) sent=([0-9]{1,10}) total=([0-9]{1,10})")
+CONTROL_PROGRESS = re.compile(
+    r"CTRL ([A-Z_]+) sent=([0-9]{1,10}) total=([0-9]{1,10})((?: [a-z_]+=[0-9]{1,10})*)"
+)
 CONTROL_ERROR = re.compile(r"CTRL ERROR ([A-Z_]+)")
+UINT32_MAX = 0xFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class ArduinoLine:
     text: str
     at: datetime
     report: ArduinoReport | None = None
+    received_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,14 +52,28 @@ class ArduinoControl:
     sent: int | None = None
     total: int | None = None
     error: str | None = None
+    extra: dict[str, int] = field(default_factory=dict)
 
 
 def parse_arduino_control(text: str) -> ArduinoControl | None:
+    if len(text) > MAX_CONSOLE_LINE_BYTES:
+        return None
     match = CONTROL_PROGRESS.fullmatch(text)
     if match:
-        event, sent_text, total_text = match.groups()
+        event, sent_text, total_text, suffix = match.groups()
         sent, total = int(sent_text), int(total_text)
-        return ArduinoControl(event, sent, total) if sent <= total <= 0xFFFFFFFF else None
+        if not sent <= total <= UINT32_MAX:
+            return None
+        extra: dict[str, int] = {}
+        for part in suffix.split():
+            key, value = part.split("=")
+            number = int(value)
+            if key in extra or key in ("sent", "total") or number > UINT32_MAX:
+                return None
+            extra[key] = number
+        if extra.get("rad_on", 0) not in (0, 1):
+            return None
+        return ArduinoControl(event, sent, total, extra=extra)
     match = CONTROL_ERROR.fullmatch(text)
     if match:
         return ArduinoControl("ERROR", error=match[1])
@@ -64,7 +82,9 @@ def parse_arduino_control(text: str) -> ArduinoControl | None:
     return None
 
 
-def parse_arduino_report(line: bytes) -> ArduinoReport | None:
+def parse_arduino_report(
+    line: bytes, *, received_ns: int | None = None, received_at: datetime | None = None,
+) -> ArduinoReport | None:
     if len(line) > MAX_REPORT_BYTES:
         return None
     try:
@@ -81,14 +101,15 @@ def parse_arduino_report(line: bytes) -> ArduinoReport | None:
     if not all(value.isdecimal() and len(value) <= 10 for value in numbers):
         return None
     uptime_ms, sequence, dropped = map(int, numbers)
-    if max(uptime_ms, sequence, dropped) > 0xFFFFFFFF:
+    if max(uptime_ms, sequence, dropped) > UINT32_MAX:
         return None
     if any(value not in ("0", "1") for value in bits) or fault not in (None, "0", "1"):
         return None
     ready, rad_on, matrix = (value == "1" for value in bits)
     return ArduinoReport(
         uptime_ms, event, sequence, ready, rad_on, None if fault is None else fault == "1",
-        dropped, matrix, time.perf_counter_ns(), datetime.now().astimezone(),
+        dropped, matrix, received_ns if received_ns is not None else time.perf_counter_ns(),
+        received_at if received_at is not None else datetime.now().astimezone(),
     )
 
 
@@ -134,15 +155,16 @@ class ArduinoClient:
             except queue.Full as exc:
                 raise RuntimeError("命令队列已满。请稍后再发送。") from exc
 
-    def _emit_line(self, direction: str, text: str, report: ArduinoReport | None = None) -> None:
-        at = report.received_at if report else datetime.now().astimezone()
-        self.on_event("arduino_line", ArduinoLine(direction, text, at, report))
+    def _emit_line(self, direction: str, text: str) -> None:
+        received_ns = time.perf_counter_ns()
+        received_at = datetime.now().astimezone()
+        self.on_event("arduino_line", ArduinoLine(direction, text, received_at, received_ns=received_ns))
 
     def _run(self) -> None:
         try:
             serial = importlib.import_module("serial")
         except ImportError:
-            self.on_event("arduino_disconnected", "缺少 pyserial。请运行 run_gui.bat 安装依赖。")
+            self.on_event("arduino_disconnected", r"缺少 pyserial。请运行 .\.venv\Scripts\python.exe -m pip install -r requirements.txt")
             return
         while not self._stop.is_set():
             self.on_event("arduino_status", f"正在打开 {self.port}")
@@ -194,6 +216,8 @@ class ArduinoClient:
                 discard = False
             if not chunk:
                 continue
+            received_ns = time.perf_counter_ns()
+            received_at = datetime.now().astimezone()
             *lines, pending = (pending + chunk).split(b"\n")
             if len(pending) > MAX_CONSOLE_LINE_BYTES:
                 lines.append(pending)
@@ -203,8 +227,8 @@ class ArduinoClient:
                 line = line.rstrip(b"\r")
                 if not line:
                     continue
-                report = parse_arduino_report(line)
+                report = parse_arduino_report(line, received_ns=received_ns, received_at=received_at)
                 text = line[:MAX_CONSOLE_LINE_BYTES].decode("utf-8", errors="replace")
                 if len(line) > MAX_CONSOLE_LINE_BYTES:
                     text += "…（行已截断）"
-                self._emit_line("RX", text, report)
+                self.on_event("arduino_line", ArduinoLine("RX", text, received_at, report, received_ns))

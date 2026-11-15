@@ -38,7 +38,16 @@ Arduino UNO R4 WiFi 通过电脑 USB 供电和接收命令。接线端使用五�
 | `STOP` | 释放 `START`，取消剩余次数。 |
 | `CLEAR FAULT` | 实际 `FAULT=0` 时解除 Arduino 的故障锁。 |
 
-`START` 和 `START 100` 在每次启动检测前，都等 `READY=1`、`RAD_ON=0` 和 `FAULT=0` 连续保持 2 秒。`START 100` 每次脉冲后，程序等待 `READY` 撤销并重新有效。随后才开始下一次等待。`CTRL TRIGGER` 中的 `sent` 是已发脉冲数。用设备结果记录核对实际完成次数。
+每次发出普通 `START` 脉冲前，板端等待 `READY=1`、`RAD_ON=0` 和 `FAULT=0` 连续保持 2 秒。脉冲发出后，板端用 `READY` 撤销或 `RAD_ON` 有效确认设备响应。收到响应后，板端等待输入恢复到就绪、无出束、无故障状态，再开始下一次等待。用设备结果记录核对实际完成次数。
+
+| 板端回报 | 含义 |
+| --- | --- |
+| `TRIGGER` | 已发出一个脉冲。`sent` 是本批已发数，`total` 是请求数，`t_ms` 是发出脉冲时的板端运行时间。 |
+| `START_BLOCKED` | 发脉冲前发现输入条件变化。板端重新等待就绪。 |
+| `NO_RESPONSE` | 发出脉冲后约 3 秒内，板端未看到 `READY` 撤销或 `RAD_ON` 有效。若本批仍有余量，板端重新检查输入条件后继续。 |
+| `CYCLE_END` | 板端看到设备响应，输入随后恢复到就绪、无出束、无故障状态。`rad_on` 表示本脉冲后是否看到出束，`ms` 是距触发的毫秒数。 |
+| `READY_RETURN_TIMEOUT` | 板端看到设备响应，等待 5 分钟后输入仍未恢复。板端取消剩余触发。 |
+| `SUMMARY` | 普通批次结束时，报告 `sent`、`total`、`no_response` 和 `rad_on_cycles`。最后一项是板端看到 `RAD_ON` 有效的触发次数。 |
 
 `DOUBLE START` 用于在受控台架上复现 PLC 误发。命令在空闲时接收。每次接收发出两个约 100 ms 的低脉冲。间隔从第一脉冲释放时算起，因此两次下降沿约相隔 0.6 秒或 1.1 秒。`READY`、`RAD_ON` 和 `FAULT` 供串口记录。两次脉冲只按定时发送，即使 Arduino 已锁定 `FAULT`。可用 `STOP` 取消发送。
 
@@ -49,5 +58,7 @@ Arduino UNO R4 WiFi 通过电脑 USB 供电和接收命令。接线端使用五�
 ## 先做单板检查
 
 Arduino 只接 USB。把 `D2` 接到 Arduino `GND` 来模拟 `READY`。发送 `START`。约 2 秒后，串口应显示 `CTRL TRIGGER sent=1 total=1`。断开 `D2` 跳线再接回，模拟设备重新就绪。串口应显示 `CTRL DONE`。
+
+保持 `D2` 连接 `GND`，再发送 `START`。确认串口显示 `CTRL TRIGGER`。约 3 秒后，确认串口依次显示 `CTRL NO_RESPONSE`、`CTRL SUMMARY` 和 `CTRL DONE`。确认汇总中的 `no_response=1` 和 `rad_on_cycles=0`。
 
 发送 `START 100`。在等待期间把 `D8` 接到 Arduino `GND`，确认收到 `CTRL FAULT_STOPPED`。移除 `D8` 跳线。输入 `CLEAR FAULT`，再输入 `START`，确认可以开始新的一轮。
