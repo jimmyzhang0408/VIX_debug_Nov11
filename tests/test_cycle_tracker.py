@@ -217,6 +217,76 @@ class CycleTrackerTests(unittest.TestCase):
         self.assertEqual(record.outcome, Outcome.NORMAL)
         self.assertEqual(record.test_id_status, "gap")
 
+    def ordered(self, test_id, at, status, delta, key):
+        self.tracker.on_result(ResultNotice(str(test_id), True, status, delta), at, result_key=key)
+
+    def test_id_jump_assigns_lost_result_to_earlier_cycle_while_both_wait(self):
+        # Usual device order: final 206 first, then 201. Cycle 2's final is lost
+        # and cycle 3's final arrives before cycle 2 reaches its deadline.
+        self.begin(1, 0)
+        self.ordered(1, NS, "first", None, "k1")
+        self.tracker.on_api(201, COMPLETE, 2 * NS)
+        self.begin(2, 5 * NS)
+        self.tracker.on_api(201, COMPLETE, 8 * NS)
+        self.begin(3, 10 * NS)
+        self.ordered(3, 11 * NS, "gap", 2, "k3")
+        self.tracker.on_api(201, COMPLETE, 12 * NS)
+        self.tracker.tick(30 * NS)
+        by_no = {c.no: c for c in self.closed}
+        self.assertEqual([by_no[n].outcome for n in (1, 2, 3)],
+                         [Outcome.NORMAL, Outcome.NO_RESULT, Outcome.NORMAL])
+        self.assertEqual(by_no[3].test_id, "3")
+        self.assertEqual(len(self.closed), 3)
+
+    def test_id_jump_claims_cycle_already_closed_as_no_result(self):
+        self.begin(1, 0)
+        self.ordered(1, NS, "first", None, "k1")
+        self.tracker.on_api(201, COMPLETE, 2 * NS)
+        self.begin(2, 5 * NS)
+        self.tracker.on_api(201, COMPLETE, 8 * NS)
+        self.tracker.tick(14 * NS)
+        self.begin(3, 15 * NS)
+        self.ordered(3, 16 * NS, "gap", 2, "k3")
+        self.tracker.on_api(201, COMPLETE, 17 * NS)
+        by_no = {c.no: c for c in self.closed}
+        self.assertEqual([by_no[n].outcome for n in (1, 2, 3)],
+                         [Outcome.NORMAL, Outcome.NO_RESULT, Outcome.NORMAL])
+        self.assertEqual(len(self.closed), 3)
+        self.assertTrue(by_no[2].id_accounted)
+
+    def test_each_lost_cycle_is_claimed_once(self):
+        self.begin(1, 0)
+        self.tracker.on_api(201, COMPLETE, NS)
+        self.begin(2, 3 * NS)
+        self.tracker.on_api(201, COMPLETE, 4 * NS)
+        self.begin(3, 6 * NS)
+        self.ordered(30, 7 * NS, "gap", 3, "k3")
+        self.tracker.on_api(201, COMPLETE, 8 * NS)
+        self.begin(4, 10 * NS)
+        self.ordered(31, 11 * NS, "consecutive", 1, "k4")
+        self.tracker.on_api(201, COMPLETE, 12 * NS)
+        self.assertEqual([c.outcome for c in sorted(self.closed, key=lambda c: c.no)],
+                         [Outcome.NO_RESULT, Outcome.NO_RESULT, Outcome.NORMAL, Outcome.NORMAL])
+
+    def test_id_jump_does_not_skip_cycle_without_stop(self):
+        # A cycle that has not stopped yet cannot be judged lost.
+        self.begin(1, 0)
+        self.begin(2, NS)
+        self.ordered(5, 2 * NS, "gap", 2, "k5")
+        self.assertFalse([c for c in self.closed if c.outcome is Outcome.NO_RESULT])
+
+    def test_proximity_cycle_is_not_counted_in_id_order(self):
+        self.begin(1, 0)
+        self.tracker.on_api(201, PROXIMITY, NS)
+        self.begin(2, 3 * NS)
+        self.ordered(7, 4 * NS, "consecutive", 1, "k7")
+        self.tracker.on_api(201, COMPLETE, 5 * NS)
+        self.tracker.tick(10 * NS)
+        by_no = {c.no: c for c in self.closed}
+        self.assertEqual(by_no[1].outcome, Outcome.EMPTY_SHOT)
+        self.assertEqual(by_no[2].outcome, Outcome.NORMAL)
+        self.assertEqual(by_no[2].test_id, "7")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,6 +64,7 @@ class Cycle:
     board_no_response: bool = False
     board_rad_on: bool = False
     uncertain: bool = False
+    id_accounted: bool = False
     outcome: Outcome | None = None
     closed_ns: int | None = None
     notes: list[str] = field(default_factory=list)
@@ -119,6 +120,7 @@ class CycleTracker:
         self._double_pending: Cycle | None = None
         self._second_candidate: Cycle | None = None
         self._endpoint: str | None = None
+        self._last_final_first_ns = -1
         # Keep recent identities to keep late packets out of newer cycles.
         self._closed: deque[Cycle] = deque(maxlen=128)
 
@@ -186,6 +188,7 @@ class CycleTracker:
         self.counts.clear()
         self.triggers = 0
         self._sequence = 0
+        self._last_final_first_ns = -1
         return pending
 
     def on_trigger(self, sent: int, now_ns: int) -> None:
@@ -341,7 +344,11 @@ class CycleTracker:
         if notice.is_final is None:
             self.on_invalid(now_ns, "206 缺少有效的终态标记")
             return
-        cycle = self._pick_result(notice.test_id, result_key, now_ns, notice.is_final)
+        cycle = None
+        if notice.is_final and not self._known_result(notice.test_id, result_key):
+            cycle = self._pick_by_id_order(notice, now_ns)
+        if cycle is None:
+            cycle = self._pick_result(notice.test_id, result_key, now_ns, notice.is_final)
         if cycle is None:
             if notice.is_final:
                 self._orphan_result(notice, result_key, now_ns)
@@ -356,13 +363,58 @@ class CycleTracker:
         if notice.is_final:
             cycle.final_206_ns = now_ns
             cycle.test_id_status = notice.id_status
+            self._last_final_first_ns = max(self._last_final_first_ns, cycle.first_ns)
             self._resolve(cycle, now_ns)
         else:
             cycle.intermediate_206 += 1
 
+    def _known_result(self, test_id: str, key: str | None) -> bool:
+        return bool(test_id) and any(c.test_id == test_id and (not key or c.result_key == key)
+                                     for c in self._closed)
+
+    def _pick_by_id_order(self, notice: ResultNotice, now_ns: int) -> Cycle | None:
+        """Match a final 206 to a cycle by testID order.
+
+        Pulses that end in proximity or user-abort do not consume a testID, so
+        only cycles that can still produce a final result take part. A final
+        whose testID advanced by N means N-1 earlier result-bearing cycles never
+        delivered theirs: those are closed as NO_RESULT and the final goes to
+        the next one. Anything that cannot be explained this way is left to
+        the conservative matcher.
+        """
+        delta = notice.id_delta
+        if notice.id_status not in ("consecutive", "gap") or type(delta) is not int or delta < 1:
+            return None
+        started = sorted((c for c in self.open_cycles
+                          if c.first_ns <= now_ns and c.final_206_ns is None
+                          and (c.ev200_ns is not None or c.ev201_ns is not None)),
+                         key=lambda c: c.first_ns)
+        if any(c.stop_class == "unknown" for c in started):
+            return None
+        waiting = [c for c in started if c.stop_class in (None, "complete")]
+        lost = delta - 1
+        # Cycles already closed as NO_RESULT after the previous final may be
+        # the ones this jump accounts for. Each can be claimed only once.
+        closed = sorted((c for c in self._closed
+                         if c.outcome is Outcome.NO_RESULT and not c.id_accounted
+                         and c.final_206_ns is None and c.first_ns > self._last_final_first_ns),
+                        key=lambda c: c.first_ns)[:lost]
+        skipped = waiting[:lost - len(closed)]
+        if len(waiting) <= len(skipped) or any(c.ev201_ns is None for c in skipped):
+            return None
+        if lost == 0 and len(waiting) != 1:
+            return None
+        target = waiting[len(skipped)]
+        for cycle in closed:
+            cycle.id_accounted = True
+        for cycle in skipped:
+            cycle.id_accounted = True
+            self._close(cycle, Outcome.NO_RESULT, now_ns,
+                        f"后续最终 206 的 testID 前进 {delta}，该周期的最终 206 未收到")
+        return target
+
     def _pick_result(self, test_id: str, key: str | None, now_ns: int, final: bool) -> Cycle | None:
-        if test_id and any(c.test_id == test_id and (not key or c.result_key == key)
-                           for c in self._closed):
+        if self._known_result(test_id, key):
             return None
         candidates = [c for c in self.open_cycles if c.first_ns <= now_ns
                       and c.final_206_ns is None]
