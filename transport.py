@@ -7,13 +7,15 @@ import ipaddress
 import json
 import math
 import re
+import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from arduino import ArduinoReport
+from arduino import ArduinoLine, ArduinoReport
 
 
 EventHandler = Callable[[str, Any], None]
@@ -24,6 +26,7 @@ class ReceivedPacket:
     raw: str | bytes
     received_ns: int
     received_at: datetime
+    rx_no: int = 0
 
 
 def _endpoint(host: str, port: int) -> str:
@@ -60,6 +63,16 @@ def _shutdown(ws: Any) -> None:
             ws.close(timeout=0)
         except Exception:
             pass
+
+
+def _tune_keepalive(sock: socket.socket) -> None:
+    if sys.platform == "win32":
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 1000))
+    else:
+        for name, value in (("TCP_KEEPIDLE", 5), ("TCP_KEEPINTVL", 1), ("TCP_KEEPCNT", 5)):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
 class ListenerClient:
@@ -122,13 +135,19 @@ class ListenerClient:
             reason = "设备连接已关闭。"
             try:
                 self.on_event("status", f"正在连接 {self.endpoint}")
-                ws = self._module.WebSocket(enable_multithread=True)
+                # The application validates and logs invalid text payloads.
+                ws = self._module.WebSocket(enable_multithread=True, skip_utf8_validation=True)
                 # Publish before connect/handshake so stop() can close an active read.
                 with self._lock:
                     self._ws = ws
                 if self._stop.is_set():
                     break
-                ws.connect(self.endpoint, timeout=3.0, http_no_proxy=["*"])
+                ws.connect(self.endpoint, timeout=3.0, http_no_proxy=["*"],
+                           sockopt=((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),))
+                try:
+                    _tune_keepalive(ws.sock)
+                except (AttributeError, OSError) as exc:
+                    self.on_event("status", f"TCP 保活参数无法设置：{exc}")
                 if self._stop.is_set():
                     break
                 ws.send(self.GREETING)  # The only application message this client sends.
@@ -141,19 +160,19 @@ class ListenerClient:
                     break
                 ws.settimeout(0.5)
                 self.on_event("connected", self.endpoint)
+                rx_no = 0
                 while not self._stop.is_set():
                     try:
-                        raw = ws.recv()
+                        opcode, raw = ws.recv_data()
                         # Record complete-message receipt before parsing or callbacks.
                         received_ns = time.perf_counter_ns()
                         received_at = datetime.now().astimezone()
                     except self._module.WebSocketTimeoutException:
                         continue
-                    if self._stop.is_set():
-                        break
-                    if raw is None or raw == "" or raw == b"":
+                    if opcode == self._module.ABNF.OPCODE_CLOSE:
                         raise ConnectionError("设备已断开连接。")
-                    self.on_event("packet", ReceivedPacket(raw, received_ns, received_at))
+                    rx_no += 1
+                    self.on_event("packet", ReceivedPacket(raw, received_ns, received_at, rx_no))
             except Exception as exc:
                 reason = f"设备连接中断：{exc}"
             finally:
@@ -202,20 +221,37 @@ class DemoClient:
             {"commandId": 403, "id": notification_id, "params": params},
             ensure_ascii=False,
         )
-        stamp_ns = time.perf_counter_ns()
-        stamp_at = datetime.now().astimezone()
-        self.on_event("packet", ReceivedPacket(raw, stamp_ns, stamp_at))
+        self._rx_no += 1
+        self.on_event("packet", ReceivedPacket(raw, time.perf_counter_ns(),
+                                                datetime.now().astimezone(), self._rx_no))
+
+    def _send_control(self, event: str, sent: int, total: int, extra: str = "") -> None:
+        text = f"CTRL {event} sent={sent} total={total}{extra}"
+        self.on_event("arduino_line", ArduinoLine("RX", text, datetime.now().astimezone(),
+                                                   received_ns=time.perf_counter_ns()))
 
     def _send_gpio(self, event: str, *, ready: bool, rad_on: bool) -> None:
         stamp_ns = time.perf_counter_ns()
-        if event != "BOOT":
+        self._gpio_ready = ready
+        self._gpio_rad_on = rad_on
+        if event not in ("BOOT", "STATE"):
             self._gpio_sequence += 1
         self.on_event("arduino_report", ArduinoReport(
             (stamp_ns - self._gpio_started_ns) // 1_000_000, event, self._gpio_sequence,
             ready, rad_on, False, 0, True, stamp_ns, datetime.now().astimezone(),
         ))
 
+    def _pause(self, seconds: float) -> bool:
+        """Keep the simulated serial state current while waiting for a deadline."""
+        while seconds > 1.0:
+            if self._stop.wait(1.0):
+                return True
+            self._send_gpio("STATE", ready=self._gpio_ready, rad_on=self._gpio_rad_on)
+            seconds -= 1.0
+        return self._stop.wait(seconds)
+
     def _run(self) -> None:
+        self._rx_no = 0
         self.on_event("connected", self.endpoint)
         self.on_event("arduino_connected", "演示串口")
         self._gpio_started_ns = time.perf_counter_ns()
@@ -223,45 +259,74 @@ class DemoClient:
         self._send_gpio("BOOT", ready=True, rad_on=False)
         self._send(100, {"systemStatus": "Ready"})
         test_id = 1
+        daily_id = 1
+        scenario = 0
         try:
             while not self._stop.is_set():
-                self._send_gpio("READY", ready=False, rad_on=False)
-                self._send_gpio("RAD_ON", ready=False, rad_on=True)
-                self._send(200, {})
-                self._send(202, {"exposureNum": 1, "maxExposures": 1})
-                if self._stop.wait(0.5):
+                if not self._demo_cycle(scenario, test_id, daily_id):
                     break
-                analysis = {
-                    "testId": test_id,
-                    "tidName": str(test_id),
-                    "testDateTime": datetime.now().isoformat(),
-                    "elapsedTime": 0.5,
-                    "methodId": "alloyPlus-demo",
-                    "methodDispName": "Alloy Plus（演示）",
-                    "final": False,
-                }
-                chemistry = [
-                    {"elementName": "Fe", "concentration": 68.82, "error": 0.12},
-                    {"elementName": "Cr", "concentration": 18.10, "error": 0.06},
-                    {"elementName": "Ni", "concentration": 10.55, "error": 0.04},
-                    {"elementName": "Mo", "concentration": 2.53, "error": 0.02},
-                ]
-                self._send(206, {"result": {"analysis": dict(analysis), "chemistry": chemistry}})
-                if self._stop.wait(0.5):
-                    break
-                self._send_gpio("RAD_ON", ready=False, rad_on=False)
-                self._send(203, {"exposureNum": 1, "maxExposures": 1})
-                self._send(201, {"stopReason": "Test Complete", "stopReasonInt": 0})
-                if self._stop.wait(0.25):
-                    break
-                analysis["final"] = True
-                analysis["elapsedTime"] = 1
-                final_chemistry = [{**chemistry[0], "concentration": 68.62}, *chemistry[1:]]
-                self._send(206, {"result": {"analysis": analysis, "processedChemistry": final_chemistry}})
-                self._send_gpio("READY", ready=True, rad_on=False)
-                test_id += 1
-                if self._stop.wait(2.0):
-                    break
+                if scenario in (0, 2, 5):
+                    test_id += 1
+                if scenario != 3:
+                    daily_id += 1
+                scenario = (scenario + 1) % 6
         finally:
             self.on_event("arduino_disconnected", "演示已停止")
             self.on_event("disconnected", "演示已停止。")
+
+    def _demo_cycle(self, scenario: int, test_id: int, daily_id: int) -> bool:
+        double = scenario == 4
+        self._send_control("DOUBLE_FIRST" if double else "TRIGGER", 1, 2 if double else 1)
+        if scenario == 3:
+            if self._pause(3.1):
+                return False
+            self._send_control("NO_RESPONSE", 1, 1, " rad_on=0 ms=3100")
+            self._send_control("SUMMARY", 1, 1, " no_response=1 rad_on_cycles=0")
+            self._send_control("DONE", 1, 1)
+            return not self._pause(0.5)
+
+        analysis = {
+            "testId": test_id, "dailyId": daily_id, "tidName": str(daily_id),
+            "testDateTime": datetime.now().isoformat(), "elapsedTime": 0.5,
+            "methodId": "alloyPlus-demo", "methodDispName": "Alloy Plus（演示）", "final": False,
+        }
+        chemistry = [
+            {"elementName": "Fe", "concentration": 68.82, "error": 0.12},
+            {"elementName": "Cr", "concentration": 18.10, "error": 0.06},
+            {"elementName": "Ni", "concentration": 10.55, "error": 0.04},
+            {"elementName": "Mo", "concentration": 2.53, "error": 0.02},
+        ]
+        self._send(702, {})
+        self._send_gpio("READY", ready=False, rad_on=False)
+        self._send(200, {})
+        self._send_gpio("RAD_ON", ready=False, rad_on=True)
+        exposure = {"exposureNum": 1, "maxExposures": 1}
+        self._send(202, exposure)
+        if self._pause(0.5):
+            return False
+        self._send(206, {"result": {"analysis": dict(analysis), "chemistry": chemistry}})
+        if double:
+            self._send_control("DOUBLE_SECOND", 2, 2)
+
+        reason, code = {1: ("Proximity Failure", 6), 4: ("User Abort", 2)}.get(scenario, ("Test Complete", 0))
+        self._send_gpio("RAD_ON", ready=False, rad_on=False)
+        self._send(203, {**exposure, "finalExposureStatus": reason if code else "Time Elapsed"})
+        self._send(201, {"stopReason": reason, "stopReasonInt": code})
+        if scenario in (0, 5):
+            if self._pause(0.25):
+                return False
+            analysis.update(final=True, elapsedTime=1)
+            if scenario == 5:
+                chemistry[0]["concentration"] = math.nan
+            self._send(206, {"result": {"analysis": analysis, "processedChemistry": chemistry}})
+        self._send_gpio("READY", ready=True, rad_on=False)
+        self._send(100, {"systemStatus": "Ready"})
+        if double:
+            self._send_control("DOUBLE_DONE", 2, 2)
+        else:
+            self._send_control("CYCLE_END", 1, 1, " rad_on=1 ms=500")
+            self._send_control("SUMMARY", 1, 1, " no_response=0 rad_on_cycles=1")
+            self._send_control("DONE", 1, 1)
+        # Let the real tracker reach its deadlines in demo mode.
+        delay = {1: 3.2, 2: 5.2, 4: 3.2}.get(scenario, 1.5)
+        return not self._pause(delay)

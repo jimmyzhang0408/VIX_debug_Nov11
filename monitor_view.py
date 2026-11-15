@@ -52,7 +52,10 @@ def _display_number(value) -> str:
     if value is None:
         return "—"
     if isinstance(value, (int, float)):
-        return format(value, ".9g")
+        try:
+            return format(value, ".9g")
+        except OverflowError:
+            pass
     return bounded_line(str(value))
 
 
@@ -157,11 +160,12 @@ class PacketMonitor(ttk.Frame):
             values = (entry["roundPacketNo"], test_id, json.dumps(entry["isFinal"]), bounded_line(entry.get("deviceTestTime") or "—"),
                       str(device_elapsed) if device_elapsed is not None else "—", entry["received_at"],
                       bounded_line(packet.check) or "—", bounded_line(packet.export_text))
-            warning = entry.get("testIDStatus") in ("gap", "backward", "conflict", "repeated_id")
+            gap = entry.get("testIDStatus") in ("gap", "gap_after_reconnect")
+            warning = gap or entry.get("testIDStatus") in ("backward", "conflict", "repeated_id")
             if packet.export and packet.export["status"] in ("conflict", "invalid_id", "error"):
                 warning = True
             tags = ("warning",) if warning else ()
-            if entry.get("testIDStatus") == "gap":
+            if gap:
                 tags = ("gap",)
             if iid not in current:
                 self.packets.insert("", "end", iid=iid, values=values, tags=tags)

@@ -42,7 +42,10 @@ def log_preview(value) -> str:
 
 def bounded_line(text: str) -> str:
     # A single device packet must never create thousands of wrapped Tk lines.
-    text = str(text).replace("\r", "\\r").replace("\n", "\\n")
-    if len(text) > MAX_LOG_LINE:
+    text = str(text)
+    truncated = len(text) > MAX_LOG_LINE
+    text = text[:MAX_LOG_LINE].encode("utf-8", "backslashreplace").decode("utf-8")
+    text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\0", "\\0")
+    if truncated or len(text) > MAX_LOG_LINE:
         return text[:MAX_LOG_LINE - 25] + "…（完整内容见日志文件）"
     return text

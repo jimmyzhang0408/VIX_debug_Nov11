@@ -25,6 +25,9 @@ class ResultNotice:
     is_final: bool | None = None
     id_status: str | None = None
     id_delta: int | None = None
+    daily_id_num: int | None = None
+    daily_id_status: str | None = None
+    daily_id_delta: int | None = None
 
 
 @dataclass
@@ -40,10 +43,31 @@ class Measurement:
     method: str = ""
     elements: list[Element] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    daily_id_num: int | None = None
 
     @property
     def device_timing(self) -> tuple[str, int | float | None]:
         return read_device_timing(self.raw_result)
+
+
+def parse_device_json(raw: str) -> tuple[Any, bool]:
+    """Preserve non-finite readings as strings in otherwise valid JSON."""
+    nonfinite = False
+
+    def constant(name: str) -> str:
+        nonlocal nonfinite
+        nonfinite = True
+        return name
+
+    def number(source: str) -> float | str:
+        value = float(source)
+        if math.isfinite(value):
+            return value
+        return constant("-Infinity" if value < 0 else "Infinity")
+
+    data = json.loads(raw, parse_constant=constant, parse_float=number)
+    return data, nonfinite
+
 
 def _identifier(value: Any) -> str:
     if isinstance(value, bool) or value is None:
@@ -92,6 +116,16 @@ def read_device_timing(result: dict | None) -> tuple[str, int | float | None]:
     return device_time, elapsed if valid_elapsed else None
 
 
+def _device_day(analysis: dict) -> str | None:
+    timestamp = analysis.get("testDateTime")
+    if isinstance(timestamp, str):
+        try:
+            return datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def parse_elements(result: dict, *, source: str | None = None) -> tuple[list[Element], list[str]]:
     issues: list[str] = []
     if source is None:
@@ -117,8 +151,9 @@ def parse_elements(result: dict, *, source: str | None = None) -> tuple[list[Ele
 class ListenerModel:
     """Read each result independently and detect repeated final results."""
 
-    def __init__(self, max_records: int = 1000):
+    def __init__(self, max_records: int = 1000, max_seen: int = 100_000):
         self.max_records = max(1, max_records)
+        self.max_seen = max(self.max_records, max_seen)
         self.records: list[Measurement] = []
         self.intermediate_count = 0
         self.duplicate_count = 0
@@ -126,18 +161,25 @@ class ListenerModel:
         self.endpoint = ""
         self._seq = 0
         self._last_final_number: int | None = None
-        self._seen: OrderedDict[str, tuple[str, Measurement]] = OrderedDict()
+        self._reconnected = False
+        self._last_daily: tuple[str, int] | None = None
+        self._seen: OrderedDict[tuple[str, str | bytes], tuple[bytes, int]] = OrderedDict()
 
     def begin_session(self, endpoint: str) -> None:
+        if self.session and endpoint == self.endpoint:
+            self._reconnected = self._last_final_number is not None
+        else:
+            self.reset_test_id_sequence()
         self.session += 1
         self.endpoint = endpoint
-        self.reset_test_id_sequence()
 
     def reset_test_id_sequence(self) -> None:
         self._last_final_number = None
+        self._reconnected = False
+        self._last_daily = None
 
     def process(self, message: dict, received_ns: int, received_at: datetime, *,
-                compare_test_ids: bool = True) -> ResultNotice | None:
+                compare_test_ids: bool = True, nonfinite: bool = False) -> ResultNotice | None:
         if not isinstance(message, dict) or message.get("commandId") != 403 or message.get("id") != 206:
             return None
         result = result_payload(message.get("params"))
@@ -147,13 +189,14 @@ class ListenerModel:
         analysis = result.get("analysis")
         final = analysis.get("final") if isinstance(analysis, dict) else None
         if final is True:
-            return self._final(result, test_id, received_ns, received_at, compare_test_ids=compare_test_ids)
+            return self._final(result, test_id, received_ns, received_at,
+                               compare_test_ids=compare_test_ids, nonfinite=nonfinite)
         if final is False:
             self.intermediate_count += 1
             return ResultNotice(test_id, False)
         return ResultNotice(test_id)
 
-    def _check_test_id(self, test_id: str, *, conflict: bool = False) -> ResultNotice:
+    def _check_test_id(self, test_id: str, *, conflict: bool = False) -> tuple[str, int | None]:
         number = None
         if test_id.isascii() and test_id.isdecimal():
             try:
@@ -164,7 +207,7 @@ class ListenerModel:
         previous = self._last_final_number
         delta = number - previous if number is not None and previous is not None else None
         if conflict:
-            return ResultNotice(test_id, True, "conflict", delta)
+            return "conflict", delta
 
         # A final result without a usable ID breaks the chain of comparisons.
         self._last_final_number = number
@@ -175,48 +218,78 @@ class ListenerModel:
         elif delta == 1:
             status = "consecutive"
         elif delta > 1:
-            status = "gap"
+            status = "gap_after_reconnect" if self._reconnected else "gap"
         elif delta < 0:
             status = "backward"
         else:
             status = "repeated_id"
-        return ResultNotice(test_id, True, status, delta)
+        if number is not None:
+            self._reconnected = False
+        return status, delta
+
+    def _check_daily(self, day: str | None, number: int | None) -> tuple[str | None, int | None]:
+        previous = self._last_daily
+        if day is None or number is None:
+            self._last_daily = None
+            return None, None
+        self._last_daily = (day, number)
+        if previous is None:
+            return "first", None
+        if day != previous[0]:
+            return ("daily_reset" if number == 1 else "first"), None
+        delta = number - previous[1]
+        if delta == 1:
+            return "consecutive", delta
+        if delta > 1:
+            return "gap", delta
+        return ("backward" if delta < 0 else "repeated_id"), delta
 
     def _final(self, result: dict, test_id: str, ns: int, at: datetime, *,
-               compare_test_ids: bool) -> ResultNotice:
-        fingerprint = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False,
-                                                separators=(",", ":")).encode("utf-8")).hexdigest()
+               compare_test_ids: bool, nonfinite: bool) -> ResultNotice:
+        fingerprint = hashlib.sha256(json.dumps(result, sort_keys=True,
+                                                separators=(",", ":")).encode("ascii")).digest()
         # The local project defines TESTID as the result identity. Changed
         # content with the same ID is a conflict, even if date/method changes.
         analysis = result["analysis"]
-        scope = f"{self.endpoint}|testId:{test_id}"
-        key = scope if test_id else f"{self.endpoint}|hash:{fingerprint}"
+        daily = analysis.get("dailyId")
+        daily = daily if type(daily) is int and daily > 0 else None
+        key = (self.endpoint, test_id or fingerprint)
         previous = self._seen.get(key)
         if previous is not None:
+            self._seen.move_to_end(key)
             self.duplicate_count += 1
             if previous[0] != fingerprint:
                 issue = "同一 testID 的结果内容有冲突。已保留第一份结果。"
-                if issue not in previous[1].issues:
-                    previous[1].issues.append(issue)
+                if self.records:
+                    history_index = previous[1] - self.records[0].seq
+                    if 0 <= history_index < len(self.records) and issue not in self.records[history_index].issues:
+                        self.records[history_index].issues.append(issue)
                 if compare_test_ids:
-                    return self._check_test_id(test_id, conflict=True)
-                return ResultNotice(test_id, True, "conflict")
-            return ResultNotice(test_id, True, "duplicate")
+                    status, delta = self._check_test_id(test_id, conflict=True)
+                    return ResultNotice(test_id, True, status, delta, daily)
+                return ResultNotice(test_id, True, "conflict", daily_id_num=daily)
+            return ResultNotice(test_id, True, "duplicate", daily_id_num=daily)
         self._seq += 1
         elements, issues = parse_elements(result)
         if not test_id:
             issues.append("缺少有效 testID。按结果内容去重。")
         if analysis.get("testErrorInfo") not in (None, "", "No error", "No error "):
             issues.append(f"设备结果信息 · {analysis['testErrorInfo']}")
+        if nonfinite:
+            issues.append("报文含非有限数值（NaN/Infinity），已按字符串保存。")
+        status, delta = self._check_test_id(test_id) if compare_test_ids else (None, None)
+        daily_status, daily_delta = self._check_daily(_device_day(analysis), daily) if compare_test_ids else (None, None)
+        if delta is not None and daily_delta is not None and delta != daily_delta:
+            issues.append(f"testID 与 dailyId 增量不同（{delta:+d} / {daily_delta:+d}）。")
         record = Measurement(
             self._seq, self.session, self.endpoint, ns, at, result,
             test_id=test_id, daily_id=str(analysis.get("tidName", "")),
             method=str(analysis.get("methodDispName") or analysis.get("methodId") or "未声明"),
-            elements=elements, issues=issues,
+            elements=elements, issues=issues, daily_id_num=daily,
         )
         self.records.append(record)
         del self.records[:-self.max_records]
-        self._seen[key] = (fingerprint, record)
-        while len(self._seen) > 4096:
+        self._seen[key] = (fingerprint, record.seq)
+        while len(self._seen) > self.max_seen:
             self._seen.popitem(last=False)
-        return self._check_test_id(test_id) if compare_test_ids else ResultNotice(test_id, True)
+        return ResultNotice(test_id, True, status, delta, daily, daily_status, daily_delta)

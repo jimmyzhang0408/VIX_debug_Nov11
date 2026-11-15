@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import json
 from collections import deque
@@ -11,11 +12,14 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime
+from statistics import median
 
 from arduino import ArduinoClient, ArduinoLine, ArduinoReport, BAUD_RATE, parse_arduino_control
-from core import ListenerModel, Measurement, parse_elements, read_device_timing, result_payload
+from core import ListenerModel, Measurement, parse_device_json, parse_elements, read_device_timing, result_payload
+from cycle_tracker import CycleTracker
 from device_status import DeviceStatus, STATUS_NOTIFICATION_IDS
 from journal import AsyncJournal
 from log_format import bounded_line
@@ -28,15 +32,19 @@ DEFAULT_IP = "169.254.90.208"
 DEFAULT_PORT = 7860
 DEFAULT_SERIAL_PORT = "COM4"
 ARDUINO_STALE_NS = 4_000_000_000
+API_STALE_WITH_CYCLE_NS = 30_000_000_000
 MAX_PACKETS_PER_TICK = 25
 POLL_BUDGET_SECONDS = 0.008
 REFRESH_SECONDS = 0.1
 MAX_LOG_BATCH = 40
 DEVICE_EVENT_IDS = STATUS_NOTIFICATION_IDS | {206}
+CONNECTION_EVENTS = frozenset(("connected", "disconnected", "stopped", "start_failed",
+                               "arduino_connected", "arduino_disconnected"))
 TEST_ID_STATUS_LABELS = {
     "first": "首条最终结果",
     "consecutive": "连续",
     "gap": "告警 · 跳号",
+    "gap_after_reconnect": "断线期间跳号 · 需核对",
     "backward": "回退",
     "repeated_id": "编号重复",
     "duplicate": "重复最终结果",
@@ -55,21 +63,61 @@ CONTROL_LABELS = {
     "FAULT_LOCKED": "故障锁定",
     "FAULT_CLEARED": "故障锁定已清除",
     "NO_FAULT_LOCK": "无故障锁定",
+    "DOUBLE_FIRST": "双 START 第一脉冲",
+    "DOUBLE_GAP": "双 START 间隔",
+    "DOUBLE_SECOND": "双 START 第二脉冲",
+    "DOUBLE_DONE": "双 START 完成",
+    "START_BLOCKED": "触发条件变化，重新等待",
+    "NO_RESPONSE": "板端未见响应",
+    "CYCLE_END": "板端周期结束",
+    "READY_RETURN_TIMEOUT": "告警 · READY 未恢复",
+    "SUMMARY": "板端批次汇总",
 }
+CYCLE_LABELS = {
+    "NORMAL": "正常",
+    "EMPTY_SHOT": "接近停测 · 无终态",
+    "DOUBLE_START_STOP": "双 START 停测",
+    "NO_RESPONSE": "未见设备响应",
+    "NO_RESULT": "正常停测 · 未收终态",
+    "ABNORMAL_STOP": "异常停测",
+    "UNKNOWN_STOP": "未知停测",
+    "UNSOLICITED": "无对应板端触发",
+    "INCONCLUSIVE": "无法判定",
+}
+CYCLE_ALERTS = frozenset(("NO_RESPONSE", "NO_RESULT", "ABNORMAL_STOP", "UNKNOWN_STOP", "INCONCLUSIVE"))
+TIMING_FIELDS = (
+    ("t_trigger_to_ack_ms", "trigger_ns", "ack_ns"),
+    ("t_trigger_to_200_ms", "trigger_ns", "ev200_ns"),
+    ("t_200_to_201_ms", "ev200_ns", "ev201_ns"),
+    ("t_201_to_final_ms", "ev201_ns", "final_206_ns"),
+)
 
 
 def stamp(value: datetime | None) -> str:
     return value.isoformat(sep=" ", timespec="milliseconds") if value else ""
 
 
+def timing_ms(start: int | None, end: int | None) -> float | None:
+    return round((end - start) / 1_000_000, 3) if start is not None and end is not None else None
+
+
+def spectrum_summary(message: dict) -> dict:
+    params = message.get("params")
+    params = params if isinstance(params, dict) else {}
+    spectrum = params.get("spectrum")
+    data = spectrum.get("data") if isinstance(spectrum, dict) else params.get("data")
+    return {**{k: message[k] for k in ("commandId", "id", "tickCount") if k in message},
+            "keys": list(params), "dataLength": len(data) if isinstance(data, (str, list, dict)) else None}
+
+
 def write_results_csv(path: Path, records: list[Measurement]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["序号", "连接会话", "数据来源", "testId", "每日编号_tidName", "方法",
+        writer.writerow(["序号", "连接会话", "数据来源", "testId", "每日编号_tidName", "dailyId", "方法",
                          "最终206接收时间", "设备检测时刻", "设备检测耗时_s", "备注"])
         for r in records:
             device_time, device_elapsed = r.device_timing
-            writer.writerow([r.seq, r.session, r.endpoint, r.test_id, r.daily_id, r.method,
+            writer.writerow([r.seq, r.session, r.endpoint, r.test_id, r.daily_id, r.daily_id_num, r.method,
                              stamp(r.result_at), device_time, device_elapsed, " / ".join(r.issues)])
 
 
@@ -93,6 +141,8 @@ class ListenerApp:
         self.generation = 0
         self.selected_seq: int | None = None
         self._closing = False
+        self._close_summarized = False
+        self._destroyed = False
         self._stopping = False
         self._start_thread = None
         self._start_cancel = None
@@ -108,7 +158,7 @@ class ListenerApp:
         self._close_poll_id = None
         self._packet_no = 0
         self._round_packet_no = 0
-        self._pending_journal = None
+        self._pending_journal = deque()
         self._live_entry = None
         self._live_displayed = None
         self._arduino_report: ArduinoReport | None = None
@@ -116,12 +166,34 @@ class ListenerApp:
         self._arduino_deadline_ns: int | None = None
         self._trigger_progress: tuple[int, int] | None = None
         self._count_start_ns = 0
+        self._round_start = datetime.now().astimezone()
+        self._round_no = 1
+        self._summary_no = 0
+        self._round_invalid = 0
+        self._round_rx_gaps = 0
+        self._round_serial_issues = 0
+        self._round_disconnects = 0
+        self._round_gap_alerts = 0
+        self._poll_errors = 0
+        self._api_connected = False
+        self._last_packet_ns = None
+        self._api_connected_ns = None
+        self._last_rx_no = 0
+        self._board_summary = None
+        self._round_first_id = self._round_last_id = None
+        self._timings = {key: [] for key, _, _ in TIMING_FIELDS}
+        self._pending_device_logs = deque(maxlen=2000)
+        self.tracker = CycleTracker(self._cycle_closed)
         event_queue = self.events
+        runtime = ROOT / "runtime"
         self._journal_writer = AsyncJournal(
-            ROOT / "runtime" / "listener_ids.jsonl",
+            runtime / "logs" / f"listener_{self._round_start:%Y%m%d_%H%M%S_%f}.jsonl",
             on_error=lambda text: event_queue.put((None, "journal_error", text)),
-            result_dir=ROOT / "runtime" / "results",
+            result_dir=runtime / "results",
             on_export=lambda seq, outcome: event_queue.put((None, "result_export", (seq, outcome))),
+            summary_dir=runtime / "summaries",
+            max_bytes=200_000_000,
+            backup_count=50,
         )
         self.host = tk.StringVar(value=DEFAULT_IP)
         self.port = tk.StringVar(value=str(DEFAULT_PORT))
@@ -138,6 +210,10 @@ class ListenerApp:
         self.device_report = tk.StringVar(value="设备报告 · 未连接")
         self.test_phase = tk.StringVar(value="检测阶段 · —")
         self.test_id_alert = tk.StringVar()
+        self.capture_status = tk.StringVar(value="未收到报文")
+        self.capture_health = tk.StringVar(value="无效报文 0 · 接收断号 0 · 本轮断线 0")
+        self.alert_count = tk.IntVar(value=0)
+        self.cycle_summary = tk.StringVar()
         self._build()
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.window.bind("<Destroy>", self._on_destroy, add=True)
@@ -171,6 +247,9 @@ class ListenerApp:
         tk.Label(header, textvariable=self.result_count, bg="#15374a", fg="white",
                  font=("Consolas", 22, "bold"), padx=12).pack(side="right")
         tk.Label(header, text="最终结果数", bg="#15374a", fg="#dcecf0").pack(side="right")
+        tk.Label(header, textvariable=self.alert_count, bg="#15374a", fg="#ffc7b4",
+                 font=("Consolas", 22, "bold"), padx=12).pack(side="right")
+        tk.Label(header, text="待核查告警数", bg="#15374a", fg="#dcecf0").pack(side="right")
 
         body = ttk.Frame(w, padding=(18, 12))
         body.pack(fill="both", expand=True)
@@ -216,6 +295,10 @@ class ListenerApp:
         ttk.Label(api_panel, textvariable=self.device_report, foreground="#126d80",
                   wraplength=420).pack(anchor="w", pady=(4, 0))
         ttk.Label(api_panel, textvariable=self.test_phase, wraplength=420).pack(anchor="w", pady=(3, 0))
+        self.capture_label = ttk.Label(api_panel, textvariable=self.capture_status, wraplength=420)
+        self.capture_label.pack(anchor="w")
+        self.health_label = ttk.Label(api_panel, textvariable=self.capture_health, wraplength=420)
+        self.health_label.pack(anchor="w")
         self.id_alert_label = ttk.Label(api_panel, textvariable=self.test_id_alert,
                                         foreground="#97361f", wraplength=420)
 
@@ -229,6 +312,10 @@ class ListenerApp:
         self.live_elements = chemistry_table(live_frame, height=5)
         self.monitor = PacketMonitor(views)
         views.add(self.monitor, text="206 报文")
+        self._build_cycle_page(views)
+        device_log_page = ttk.Frame(views, padding=6)
+        views.add(device_log_page, text="设备日志")
+        self.device_log = self._log_text(device_log_page)
         history_page = ttk.Frame(views, padding=6)
         views.add(history_page, text="最终结果")
         history_page.columnconfigure(0, weight=1)
@@ -244,12 +331,12 @@ class ListenerApp:
                         command=self._refresh_history).pack(side="right")
         history_frame = ttk.Frame(history_page)
         history_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 10))
-        columns = ("seq", "test", "method", "device_time", "device_elapsed", "final", "notes")
+        columns = ("seq", "test", "daily", "method", "device_time", "device_elapsed", "final", "notes")
         self.history = ttk.Treeview(history_frame, columns=columns, show="headings", height=4, selectmode="browse")
         for key, title, width in zip(columns,
-                                      ("序号", "testId", "检测方法", "设备检测时刻", "设备耗时 / s",
+                                      ("序号", "testId", "dailyId", "检测方法", "设备检测时刻", "设备耗时 / s",
                                        "结果接收时间", "备注"),
-                                      (50, 80, 125, 170, 100, 205, 200)):
+                                      (50, 80, 65, 125, 170, 100, 205, 200)):
             self.history.heading(key, text=title)
             self.history.column(key, width=width, minwidth=45, stretch=True)
         scroll_table(history_frame, self.history)
@@ -299,9 +386,28 @@ class ListenerApp:
         self.command_entry = ttk.Entry(command_bar, textvariable=self.serial_command, state="disabled", width=14)
         self.command_entry.pack(side="left", fill="x", expand=True)
         self.command_entry.bind("<Return>", self.send_arduino_command)
-        ttk.Label(console, text="START [次数]   ·   STOP   ·   CLEAR FAULT").grid(
+        ttk.Label(console, text="START [次数] · DOUBLE START [1/0.5] · STOP · CLEAR FAULT").grid(
             row=2, column=0, sticky="w", pady=(4, 0),
         )
+
+    def _build_cycle_page(self, views):
+        page = ttk.Frame(views, padding=6)
+        views.add(page, text="触发对账")
+        self.cycle_count_label = ttk.Label(page, textvariable=self.cycle_summary, wraplength=940)
+        self.cycle_count_label.pack(fill="x", pady=(0, 5))
+        table = ttk.Frame(page)
+        table.pack(fill="both", expand=True)
+        columns = ("cycle", "trigger", "id", "outcome", "stop", "start", "stop_ms", "final", "notes")
+        self.cycles = ttk.Treeview(table, columns=columns, show="headings", height=5)
+        for key, title, width in zip(
+            columns,
+            ("周期", "触发", "testID", "结果", "停测原因", "触发→200 ms", "200→201 ms", "201→206 ms", "备注"),
+            (45, 45, 55, 135, 130, 95, 95, 95, 245),
+        ):
+            self.cycles.heading(key, text=title)
+            self.cycles.column(key, width=width, minwidth=45)
+        self.cycles.tag_configure("warning", background="#fff0e8", foreground="#97361f")
+        scroll_table(table, self.cycles)
 
     @staticmethod
     def _log_text(parent) -> tk.Text:
@@ -325,6 +431,8 @@ class ListenerApp:
         generation = self.generation
         event_queue = self.events
         def sink(kind, payload):
+            if kind in CONNECTION_EVENTS:
+                payload = (payload, datetime.now().astimezone(), time.perf_counter_ns())
             event_queue.put((generation, kind, payload))
         try:
             demo = self.mode.get() == "本地演示"
@@ -373,7 +481,7 @@ class ListenerApp:
             for client in clients:
                 if client is not None:
                     client.stop()
-            event_queue.put((generation, "stopped", "手动断开"))
+            event_queue.put((generation, "stopped", ("手动断开", datetime.now().astimezone(), time.perf_counter_ns())))
         threading.Thread(target=worker, daemon=True).start()
 
     def _enable_commands(self, enabled: bool) -> None:
@@ -386,6 +494,11 @@ class ListenerApp:
         client = self.serial_client
         if client is None or self._stopping or self._closing or not command.strip():
             return "break"
+        if command.strip().upper().split()[:2] == ["DOUBLE", "START"]:
+            if not messagebox.askyesno("确认双 START 台架测试",
+                                       "第二个脉冲可能停止当前检测，也可能启动新检测。确认发送？",
+                                       parent=self.window, default="no"):
+                return "break"
         try:
             client.send_command(command)
         except (ValueError, OSError, RuntimeError) as exc:
@@ -399,7 +512,11 @@ class ListenerApp:
     def reset_result_count(self) -> None:
         if self._closing:
             return
-        self._count_start_ns = time.perf_counter_ns()
+        self.events.put((None, "counter_reset", (datetime.now().astimezone(), time.perf_counter_ns())))
+
+    def _reset_result_count(self, at: datetime, ns: int) -> None:
+        self._reset_audit("Reset 计数", at, ns)
+        self._count_start_ns = ns
         previous = self.result_count.get()
         previous_packets = self._round_packet_no
         self.result_count.set(0)
@@ -407,12 +524,13 @@ class ListenerApp:
         self.model.reset_test_id_sequence()
         self.monitor.clear()
         self._show_test_id_alert("")
-        self.events.put((None, "counter_reset", {
+        self._submit_log({
             "kind": "counter_reset", "id": None, "source": "app",
-            "received_at": stamp(datetime.now().astimezone()), "received_ns": self._count_start_ns,
+            "received_at": stamp(at), "received_ns": ns,
             "previousCount": previous, "resultCount": 0,
             "previousPacketCount": previous_packets, "roundPacketNo": 0,
-        }))
+        })
+        self._pending_logs.append(f"{stamp(at)}  最终结果计数和 206 序号已清零\n")
 
     def _show_test_id_alert(self, message: str) -> None:
         self.test_id_alert.set(bounded_line(message)[:200])
@@ -422,8 +540,64 @@ class ListenerApp:
             self.id_alert_label.pack_forget()
 
     def _submit_log(self, entry: dict) -> None:
-        if not self._journal_writer.submit(entry, report_full=False):
-            self._pending_journal = entry
+        entry.setdefault("roundNo", self._round_no)
+        if self._pending_journal or not self._journal_writer.submit(entry, report_full=False):
+            self._pending_journal.append(entry)
+
+    def _cycle_closed(self, cycle) -> None:
+        entry = cycle.to_entry()
+        entry.update(kind="cycle", id=None, received_at=stamp(datetime.now().astimezone()),
+                     received_ns=cycle.closed_ns, session=self.model.session)
+        self._submit_log(entry)
+        for key, values in self._timings.items():
+            value = entry.get(key)
+            if value is not None:
+                values.append(value)
+        outcome = entry["outcome"]
+        display = (cycle.no, cycle.trigger_no, cycle.test_id, CYCLE_LABELS.get(outcome, outcome), cycle.stop_reason,
+                   *(entry.get(k) for k, _, _ in TIMING_FIELDS[1:]), " / ".join(cycle.notes))
+        self.cycles.insert("", "end", values=tuple("—" if v is None else bounded_line(v) for v in display),
+                           tags=("warning",) if outcome in CYCLE_ALERTS else ())
+        if len(rows := self.cycles.get_children()) > 1000:
+            self.cycles.delete(rows[0])
+        self._dirty = True
+
+    def _write_round_summary(self, reason: str, at: datetime, ns: int) -> None:
+        self._summary_no += 1
+        counts = {key: self.tracker.counts.get(key, 0) for key in CYCLE_LABELS}
+        self._submit_log({
+            "kind": "round_summary", "id": None, "source": "app",
+            "summaryNo": self._summary_no, "reason": reason, "start": stamp(self._round_start),
+            "end": stamp(at), "received_at": stamp(at), "received_ns": ns,
+            "triggers": self.tracker.triggers, **counts, "TESTID_GAP": self._round_gap_alerts,
+            "openCycles": len(self.tracker.open_cycles), "finalResults": self.result_count.get(),
+            "disconnects": self._round_disconnects, "invalidPackets": self._round_invalid,
+            "rxSequenceGaps": self._round_rx_gaps, "serialIssues": self._round_serial_issues,
+            "internalErrors": self._poll_errors,
+            "board": self._board_summary,
+            "testIdRange": {"first": self._round_first_id, "last": self._round_last_id},
+            "evidenceComplete": not any((self._round_disconnects, self._round_invalid, self._round_rx_gaps,
+                                         self._round_serial_issues, self._poll_errors,
+                                         counts["INCONCLUSIVE"], self.tracker.open_cycles)),
+            "timing_ms": {key.removeprefix("t_").removesuffix("_ms"):
+                          {"min": min(values), "p50": median(values), "max": max(values)}
+                          for key, values in self._timings.items() if values},
+        })
+
+    def _reset_audit(self, reason: str, at: datetime, ns: int) -> None:
+        # Finish open cycles in the old round before the tracker clears its counts.
+        self.tracker.finish_open(ns, reason)
+        self._write_round_summary(reason, at, ns)
+        self.tracker.reset(ns)
+        self.cycles.delete(*self.cycles.get_children())
+        self._round_no += 1
+        self._round_start = at
+        self._round_invalid = self._round_rx_gaps = self._round_disconnects = self._round_gap_alerts = 0
+        self._round_serial_issues = 0
+        self._round_first_id = self._round_last_id = self._board_summary = None
+        for samples in self._timings.values():
+            samples.clear()
+        self._dirty = True
 
     def _receive_arduino_line(self, line: ArduinoLine) -> bool:
         text = line.text.replace("\r", "\\r").replace("\n", "\\n").replace("\0", "\\0")
@@ -432,24 +606,58 @@ class ListenerApp:
         if line.report is not None:
             self._receive_arduino(line.report)
             return True
-        entry = {
-            "kind": "arduino_serial", "id": None, "source": "arduino", "port": self._arduino_source,
-            "received_at": stamp(line.at), "direction": line.direction, "text": line.text,
-        }
+        ns = line.received_ns or time.perf_counter_ns()
+        source = "demo" if self.mode.get() == "本地演示" else "arduino"
+        entry = {"kind": "arduino_serial", "id": None, "source": source, "port": self._arduino_source,
+                 "received_at": stamp(line.at), "received_ns": ns, "direction": line.direction, "text": line.text}
         control = parse_arduino_control(line.text) if line.direction == "RX" else None
         if control is not None:
             entry.update(kind="arduino_control", event=control.event,
-                         sent=control.sent, total=control.total, error=control.error)
+                         sent=control.sent, total=control.total, error=control.error, extra=control.extra)
             if control.sent is not None and control.total is not None:
                 self._trigger_progress = (control.sent, control.total)
             detail = f"命令反馈 {control.error}" if control.error else CONTROL_LABELS.get(control.event, control.event)
             if self._trigger_progress is not None:
                 sent, total = self._trigger_progress
                 detail += f" · 已发 {sent} / {total}"
+            if control.event == "SUMMARY":
+                self._board_summary = {"sent": control.sent, "total": control.total, **control.extra}
+                detail += f" · 无响应 {control.extra.get('no_response', '—')}"
+                detail += f" · 出束 {control.extra.get('rad_on_cycles', '—')}"
+                entry["pcCycleCounts"] = dict(self.tracker.counts)
+                entry["pcOpenCycles"] = len(self.tracker.open_cycles)
+                entry["pcPulses"] = self.tracker.triggers
             self.control_status.set(f"板端批次 · {detail}")
             self._pending_logs.append(f"{timestamp}  Arduino {self._arduino_source}  {detail}\n")
         self._submit_log(entry)
-        return False
+        if control is not None and ns >= self._count_start_ns:
+            self._track_control(control, ns)
+        elif control is None and ns >= self._count_start_ns and line.direction == "RX" and (
+            "CTRL " in line.text or "t_ms=" in line.text
+        ):
+            self._serial_issue(ns, "板端状态或控制行格式无效")
+        return True
+
+    def _track_control(self, control, ns: int) -> None:
+        event, sent = control.event, control.sent
+        if event == "TRIGGER" and sent is not None:
+            self.tracker.on_trigger(sent, ns)
+        elif event == "DOUBLE_FIRST":
+            self.tracker.on_double_first(ns)
+        elif event == "DOUBLE_SECOND":
+            self.tracker.on_double_second(ns)
+        elif event == "NO_RESPONSE" and sent is not None:
+            self.tracker.on_board_no_response(sent, ns)
+        elif event == "CYCLE_END" and sent is not None:
+            self.tracker.on_board_cycle_end(sent, ns, rad_on=control.extra.get("rad_on") == 1)
+        elif event == "READY_RETURN_TIMEOUT" and sent is not None:
+            self.tracker.on_board_ready_timeout(sent, ns)
+        elif event == "FAULT_STOPPED":
+            self.tracker.on_invalid(ns, "板端因 FAULT 停止")
+
+    def _serial_issue(self, ns: int, note: str) -> None:
+        self._round_serial_issues += 1
+        self.tracker.on_invalid(ns, note)
 
     def _clear_arduino(self, status: str) -> None:
         self._arduino_report = None
@@ -467,6 +675,11 @@ class ListenerApp:
         if not report.matrix:
             details.append("矩阵未启动")
         self.serial_status.set(" · ".join(details))
+        if previous and (report.dropped > previous.dropped
+                         or report.uptime_ms < previous.uptime_ms
+                         or ((report.sequence - previous.sequence) & 0xFFFFFFFF) > 1):
+            self._serial_issue(report.received_ns, "Arduino 状态记录不连续")
+        self.tracker.on_gpio(report.ready, report.rad_on, report.received_ns)
         if report.event == "STATE" and previous is not None and (
             report.sequence, report.ready, report.rad_on, report.fault, report.dropped, report.matrix
         ) == (
@@ -488,22 +701,64 @@ class ListenerApp:
         })
 
     def _receive_packet(self, packet) -> bool:
-        raw = packet.raw.decode("utf-8") if isinstance(packet.raw, bytes) else packet.raw
-        message = json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
-        if not isinstance(message, dict):
-            raise ValueError("JSON 顶层不是对象")
-        event = message.get("id")
-        if message.get("commandId") != 403 or type(event) is not int or event not in DEVICE_EVENT_IDS:
-            return False
-
         in_round = packet.received_ns >= self._count_start_ns
-        notice = self.model.process(message, packet.received_ns, packet.received_at, compare_test_ids=in_round)
+        self._last_packet_ns = packet.received_ns
         entry = {
-            "kind": "api_status", "id": event, "message": message,
             "received_at": stamp(packet.received_at), "received_ns": packet.received_ns,
             "session": self.model.session, "endpoint": self.model.endpoint,
             "source": "demo" if self.mode.get() == "本地演示" else "device",
         }
+        if packet.rx_no:
+            entry["rxNo"] = packet.rx_no
+            if packet.rx_no != self._last_rx_no + 1:
+                entry["previousRxNo"] = self._last_rx_no
+                self._round_rx_gaps += int(in_round)
+                self.tracker.on_invalid(packet.received_ns, "WebSocket 接收序号不连续")
+            self._last_rx_no = packet.rx_no
+        try:
+            raw = packet.raw.decode("utf-8") if isinstance(packet.raw, bytes) else packet.raw
+            message, nonfinite = parse_device_json(raw)
+            if not isinstance(message, dict):
+                raise ValueError("JSON 顶层不是对象")
+        except (ValueError, TypeError, RecursionError) as exc:
+            self._record_invalid_packet(packet, entry, exc, in_round)
+            return True
+        event = message.get("id")
+        entry.update(id=event, message=message)
+        if nonfinite:
+            entry["nonFinite"] = True
+            if event != 204:
+                entry["raw"] = raw
+        if message.get("commandId") != 403 or type(event) is not int or event not in DEVICE_EVENT_IDS:
+            if event == 204 and message.get("commandId") == 403:
+                entry["message"] = spectrum_summary(message)
+            self._submit_log({**entry, "kind": "api_other"})
+            if in_round and event == 204 and message.get("commandId") == 403:
+                self.tracker.on_api(event, {}, packet.received_ns)
+            return True
+
+        entry["kind"] = "api_status"
+        try:
+            notice, device_time, params = self._process_packet(packet, entry, in_round, nonfinite)
+        except Exception as exc:
+            entry["processingError"] = bounded_line(str(exc))[:500]
+            raise
+        finally:
+            self._submit_log(entry)
+        if in_round:
+            if notice is not None:
+                self.tracker.on_result(notice, packet.received_ns, result_key=device_time or None)
+            else:
+                self.tracker.on_api(event, params, packet.received_ns)
+        return True
+
+    def _process_packet(self, packet, entry: dict, in_round: bool, nonfinite: bool):
+        event, message = entry["id"], entry["message"]
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
+        device_time = ""
+        notice = self.model.process(message, packet.received_ns, packet.received_at,
+                                    compare_test_ids=in_round, nonfinite=nonfinite)
         timestamp = packet.received_at.strftime("%H:%M:%S.%f")[:-3]
         line = f"{timestamp}  {event}"
         if notice is not None:
@@ -514,6 +769,9 @@ class ListenerApp:
             counted = in_round and notice.is_final is True and notice.id_status not in ("duplicate", "conflict")
             if counted:
                 self.result_count.set(self.result_count.get() + 1)
+                if notice.test_id:
+                    self._round_first_id = self._round_first_id or notice.test_id
+                    self._round_last_id = notice.test_id
             entry.update(
                 kind="api_result",
                 packetNo=self._packet_no,
@@ -536,75 +794,138 @@ class ListenerApp:
             if notice.id_delta is not None:
                 entry["testIDDelta"] = notice.id_delta
                 check += f"（{notice.id_delta:+d}）"
-            if notice.id_status == "gap" and notice.id_delta is not None:
+            if notice.id_status in ("gap", "gap_after_reconnect") and notice.id_delta is not None:
                 previous_id = str(int(notice.test_id) - notice.id_delta)
                 skipped = notice.id_delta - 1
                 entry["testIDGap"] = {"previous": previous_id, "skipped": skipped}
-                warning = f"告警 · testID 跳号 {previous_id} → {test_id} · 跳过 {skipped} 个编号"
+                self._round_gap_alerts += 1
+                context = "断线期间" if notice.id_status == "gap_after_reconnect" else ""
+                warning = f"待核对 · {context}testID 跳号 {previous_id} → {test_id} · {skipped} 个编号"
                 self._show_test_id_alert(warning)
                 line += f"  {warning}"
             elif check:
                 line += f"  {check}"
+            if notice.daily_id_num is not None:
+                entry.update(dailyId=notice.daily_id_num, dailyIdStatus=notice.daily_id_status,
+                             dailyIdDelta=notice.daily_id_delta)
+            if notice.daily_id_status == "gap":
+                line += f"  每日编号跳号（+{notice.daily_id_delta}）"
             if in_round:
                 self.monitor.add(entry, check)
             self._live_entry = entry
             self._history_dirty = self._history_dirty or notice.is_final is True
         else:
-            detail = self.device_status.notification(event, message.get("params", {}))
+            detail = self.device_status.notification(event, params)
             entry["description"] = detail
             line += f"  {detail}"
+            if event == 701 and isinstance(params, dict) and isinstance(params.get("messages"), list):
+                for item in params["messages"][-2000:]:
+                    self._pending_device_logs.append(f"{timestamp}  {bounded_line(str(item))}\n")
         self._pending_logs.append(bounded_line(line) + "\n")
+        return notice, device_time, params
+
+    def _record_invalid_packet(self, packet, entry: dict, exc: Exception, in_round: bool) -> None:
+        self._round_invalid += int(in_round)
+        raw = packet.raw
+        entry.update(kind="api_invalid", id=None, error=bounded_line(str(exc))[:500],
+                     rawLength=len(raw), truncated=len(raw) > 4_000_000)
+        if isinstance(raw, bytes):
+            try:
+                entry["raw"] = raw.decode("utf-8")[:4_000_000]
+            except UnicodeDecodeError:
+                entry["rawBase64"] = base64.b64encode(raw[:4_000_000]).decode("ascii")
+        else:
+            entry["raw"] = raw[:4_000_000]
         self._submit_log(entry)
-        return True
+        self._pending_logs.append(f"无效报文 · {entry['error']}\n")
+        if in_round:
+            self.tracker.on_invalid(packet.received_ns, "收到无法解析的 WebSocket 报文")
 
     def _poll(self):
         if self._poll_id is not None:
             self.window.after_cancel(self._poll_id)
             self._poll_id = None
+        try:
+            self._poll_body()
+        except Exception as exc:
+            self._poll_errors += 1
+            ns = time.perf_counter_ns()
+            self.status.set(f"内部错误 {self._poll_errors} 次 · {bounded_line(str(exc))[:180]}")
+            self._submit_log({"kind": "internal_error", "id": None, "received_ns": ns,
+                              "received_at": stamp(datetime.now().astimezone()),
+                              "traceback": traceback.format_exc()})
+            self.tracker.on_invalid(ns, "监听程序内部错误")
+        finally:
+            if not self._destroyed:
+                self._poll_id = self.window.after(30, self._poll)
+
+    def _poll_body(self):
         deadline = time.perf_counter() + POLL_BUDGET_SECONDS
         changed = False
         for index in range(MAX_PACKETS_PER_TICK):
             if index and time.perf_counter() >= deadline:
                 break
-            if self._pending_journal is not None:
-                if not self._journal_writer.submit(self._pending_journal, report_full=False):
+            while self._pending_journal:
+                if not self._journal_writer.submit(self._pending_journal[0], report_full=False):
                     break
-                self._pending_journal = None
+                self._pending_journal.popleft()
+            if self._pending_journal:
+                break
             try:
                 generation, kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
             if kind == "journal_error":
                 self.status.set(f"日志文件写入失败：{payload}")
+                self.tracker.on_invalid(time.perf_counter_ns(), "日志写入失败")
                 continue
             if kind == "result_export":
                 self.monitor.set_export(*payload)
                 changed = True
                 continue
             if kind == "counter_reset":
-                self._submit_log(payload)
-                self._pending_logs.append(f"{payload['received_at']}  最终结果计数和 206 序号已清零\n")
+                self._reset_result_count(*payload)
                 continue
             if generation != self.generation:
                 continue
+            if kind in CONNECTION_EVENTS:
+                if isinstance(payload, tuple):
+                    payload, at, ns = payload
+                else:
+                    at, ns = datetime.now().astimezone(), time.perf_counter_ns()
+                target = "arduino" if kind.startswith("arduino_") else "api"
+                self._submit_log({"kind": "connection", "id": None, "target": target,
+                                  "event": kind.removeprefix("arduino_"), "detail": str(payload),
+                                  "received_at": stamp(at), "received_ns": ns,
+                                  "session": self.model.session + int(kind == "connected")})
             if kind == "packet":
-                try:
-                    changed = self._receive_packet(payload) or changed
-                except (ValueError, TypeError, RecursionError) as exc:
-                    self.status.set(f"无效消息，已跳过：{exc}")
+                changed = self._receive_packet(payload) or changed
             elif kind == "connected":
                 self.model.begin_session(str(payload))
+                self.tracker.on_connect(ns, endpoint=str(payload))
+                self._api_connected = True
+                self._api_connected_ns = ns
+                self._last_packet_ns = None
+                self._last_rx_no = 0
                 self.device_status.connection_changed(True)
                 self._live_entry = None
                 self.status.set(f"已连接 · {payload}" + (" · 演示数据" if self.mode.get() == "本地演示" else " · 监听者"))
                 changed = True
             elif kind in ("disconnected", "stopped"):
+                lost = self._api_connected and not (self._closing or self._stopping)
+                self._api_connected = False
+                self._api_connected_ns = None
                 self.device_status.connection_changed(False)
+                self.tracker.on_disconnect(ns)
                 self._live_entry = None
                 self.status.set(f"已断开 · {payload}")
                 changed = True
+                if lost:
+                    self._round_disconnects += 1
+                    self._write_round_summary("API 意外断开", at, ns)
                 if kind == "stopped":
                     self._clear_arduino("未连接")
+                    self._write_round_summary("手动断开", at, ns)
                     self._finish_stop()
             elif kind == "start_failed":
                 if self._stopping:
@@ -614,14 +935,16 @@ class ListenerApp:
                     self.client = None
                     self._busy(self.serial_client is not None)
             elif kind == "arduino_connected":
+                self.tracker.on_connect(ns, "arduino")
                 self._arduino_source = str(payload)
                 self._trigger_progress = None
                 self.control_status.set("板端批次 · 等待控制回报")
                 self._clear_arduino(f"{payload} · {BAUD_RATE} 波特 · 等待状态")
-                self._arduino_deadline_ns = time.perf_counter_ns() + ARDUINO_STALE_NS
+                self._arduino_deadline_ns = ns + ARDUINO_STALE_NS
                 self._enable_commands(self.serial_client is not None and not self._stopping and not self._closing)
                 changed = True
             elif kind == "arduino_disconnected":
+                self.tracker.on_disconnect(ns, "arduino")
                 self._clear_arduino(str(payload))
                 self._trigger_progress = None
                 self.control_status.set("板端批次 · —")
@@ -636,18 +959,57 @@ class ListenerApp:
                 self.serial_status.set(str(payload))
             else:
                 self.status.set(str(payload))
-        if self._arduino_deadline_ns is not None and time.perf_counter_ns() >= self._arduino_deadline_ns:
+        now_ns = time.perf_counter_ns()
+        if self.events.empty() and not self._pending_journal and (
+            self._arduino_deadline_ns is not None and now_ns >= self._arduino_deadline_ns
+        ):
             detail = "状态超时" if self._arduino_report is not None else "等待 GPIO 报告"
+            self._serial_issue(now_ns, "Arduino 状态报告超时")
             self._clear_arduino(f"{self._arduino_source} · 串口已打开 · {detail}")
             changed = True
+        if self.events.empty() and not self._pending_journal:
+            self.tracker.tick(now_ns)
         self._dirty = self._dirty or changed
-        if self._dirty and time.perf_counter() >= self._next_refresh:
-            self.refresh()
+        if time.perf_counter() >= self._next_refresh:
+            self._refresh_audit(now_ns)
+            if self._dirty:
+                self.refresh()
             self._dirty = False
             self._next_refresh = time.perf_counter() + REFRESH_SECONDS
         self._flush_log(self.log, self._pending_logs)
         self._flush_log(self.serial_log, self._pending_serial_logs)
-        self._poll_id = self.window.after(30, self._poll)
+        self._flush_log(self.device_log, self._pending_device_logs)
+
+    def _refresh_audit(self, now_ns: int) -> None:
+        counts = self.tracker.counts
+        missing = counts.get("NO_RESPONSE", 0) + counts.get("NO_RESULT", 0)
+        self.alert_count.set(missing + self._round_gap_alerts)
+        self.cycle_summary.set(" · ".join([
+            f"已发脉冲 {self.tracker.triggers}",
+            *(f"{label} {counts.get(key, 0)}" for key, label in CYCLE_LABELS.items()),
+            f"跳号记录 {self._round_gap_alerts}", f"待结案 {len(self.tracker.open_cycles)}",
+        ]))
+        self.cycle_count_label.configure(foreground="#97361f" if self.alert_count.get() else "#263b4e")
+        reference = self._last_packet_ns or self._api_connected_ns
+        lag = timing_ms(reference, now_ns)
+        stalled = bool(self._api_connected and self.tracker.open_cycles and reference is not None
+                       and now_ns - reference >= API_STALE_WITH_CYCLE_NS)
+        if self._api_connected and self._last_packet_ns is not None:
+            self.capture_status.set(f"最后报文 {lag / 1000:.1f} s 前" + (" · 尚有周期待结案" if stalled else ""))
+        elif stalled:
+            self.capture_status.set(f"{lag / 1000:.1f} s 未收到首条报文 · 尚有周期待结案")
+        else:
+            self.capture_status.set("等待报文" if self._api_connected else "API 未连接")
+        self.capture_label.configure(foreground="#97361f" if stalled else "#263b4e")
+        writer = self._journal_writer
+        incomplete = any((self._round_invalid, self._round_rx_gaps, self._round_disconnects,
+                          self._round_serial_issues, self._poll_errors, writer.dropped_count, writer.failure_count))
+        self.capture_health.set(f"无效报文 {self._round_invalid} · 接收断号 {self._round_rx_gaps}"
+                                f" · 断线 {self._round_disconnects} · 串口异常 {self._round_serial_issues}"
+                                f" · 内部错误 {self._poll_errors}"
+                                f" · 日志失败/丢弃 {writer.failure_count + writer.dropped_count}"
+                                f" · 导出异常 {writer.export_issue_count}")
+        self.health_label.configure(foreground="#97361f" if incomplete or writer.export_issue_count else "#263b4e")
 
     def _finish_stop(self):
         if self._stop_poll_id is not None:
@@ -728,7 +1090,9 @@ class ListenerApp:
             self._row_cache.pop(iid, None)
         for record in self.model.records:
             device_time, device_elapsed = record.device_timing
-            values = (record.seq, record.test_id or "—", record.method or "—", bounded_line(device_time) or "—",
+            values = (record.seq, bounded_line(record.test_id) or "—", record.daily_id_num or "—",
+                      bounded_line(record.method) or "—",
+                      bounded_line(device_time) or "—",
                       str(device_elapsed) if device_elapsed is not None else "—", stamp(record.result_at),
                       bounded_line(record.issues[0]) if record.issues else "—")
             tags = ("warning",) if record.issues else ()
@@ -768,12 +1132,13 @@ class ListenerApp:
         show_elements(self.elements, r.elements if r else [])
         detail = "选中一条记录，查看结果。"
         if r:
-            detail = (f"本地序号：{r.seq}\n连接会话：{r.session}\n数据来源：{r.endpoint}\n"
-                      f"testId：{r.test_id or '未声明'}\n每日编号 tidName：{r.daily_id or '未声明'}\n"
-                      f"检测方法：{r.method or '未声明'}\n"
+            detail = (f"本地序号：{r.seq}\n连接会话：{r.session}\n数据来源：{bounded_line(r.endpoint)}\n"
+                      f"testId：{bounded_line(r.test_id) or '未声明'}\n"
+                      f"每日编号 dailyId：{r.daily_id_num or '未声明'} · tidName：{bounded_line(r.daily_id) or '未声明'}\n"
+                      f"检测方法：{bounded_line(r.method) or '未声明'}\n"
                       f"设备检测时刻：{bounded_line(device_time) or '—'}\n"
                       f"设备检测耗时 / s：{elapsed_text}\n"
-                      f"结果接收时间：{stamp(r.result_at)}\n备注：{' / '.join(r.issues) or '无'}")
+                      f"结果接收时间：{stamp(r.result_at)}\n备注：{bounded_line(' / '.join(r.issues)) or '无'}")
         self.detail.configure(state="normal")
         self.detail.delete("1.0", "end")
         self.detail.insert("1.0", detail)
@@ -782,7 +1147,12 @@ class ListenerApp:
     def clear(self):
         if self.client is not None or self.serial_client is not None:
             return
-        self.model = ListenerModel()
+        at, ns = datetime.now().astimezone(), time.perf_counter_ns()
+        self._reset_result_count(at, ns)
+        self.model.records.clear()
+        self.model.intermediate_count = self.model.duplicate_count = 0
+        self._submit_log({"kind": "ui_clear", "id": None, "source": "app",
+                          "received_at": stamp(at), "received_ns": ns, "session": self.model.session})
         self.selected_seq = None
         self._live_entry = None
         self._history_dirty = True
@@ -840,9 +1210,17 @@ class ListenerApp:
 
     def _finish_close(self):
         self._close_poll_id = None
-        if self._client_running() or self._pending_journal is not None or not self.events.empty():
+        if self._client_running() or self._pending_journal or not self.events.empty():
             self._close_poll_id = self.window.after(25, self._finish_close)
             return
+        if not self._close_summarized:
+            self._close_summarized = True
+            ns = time.perf_counter_ns()
+            self.tracker.finish_open(ns, "程序关闭")
+            self._write_round_summary("程序关闭", datetime.now().astimezone(), ns)
+            if self._pending_journal:
+                self._close_poll_id = self.window.after(25, self._finish_close)
+                return
         self._journal_writer.close(wait=False)
         if self._journal_writer.is_alive:
             self._close_poll_id = self.window.after(25, self._finish_close)
@@ -852,6 +1230,7 @@ class ListenerApp:
     def _on_destroy(self, event):
         if event.widget is not self.window:
             return
+        self._destroyed = True
         for name in ("_poll_id", "_stop_poll_id", "_close_poll_id"):
             token = getattr(self, name)
             if token is not None:

@@ -54,6 +54,9 @@ class AsyncJournal:
         *,
         result_dir: Path | None = None,
         on_export: Callable[[int, dict], None] | None = None,
+        summary_dir: Path | None = None,
+        max_bytes: int = 20_000_000,
+        backup_count: int = 5,
     ) -> None:
         if isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 1:
             raise ValueError("max_pending 必须是正整数")
@@ -61,8 +64,12 @@ class AsyncJournal:
         self.on_error = on_error
         self.result_dir = Path(result_dir) if result_dir is not None else None
         self.on_export = on_export
+        self.summary_dir = Path(summary_dir) if summary_dir is not None else None
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
         self.failure_count = 0
         self.dropped_count = 0
+        self.export_issue_count = 0
         self.last_error: str | None = None
         self._queue: queue.Queue[dict | _Barrier] = queue.Queue(max_pending)
         self._state_lock = threading.Lock()
@@ -155,7 +162,8 @@ class AsyncJournal:
         if self._handler is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._handler = _JournalHandler(
-                self.path, maxBytes=20_000_000, backupCount=5, encoding="utf-8"
+                self.path, maxBytes=self.max_bytes, backupCount=self.backup_count,
+                encoding="utf-8", errors="backslashreplace",
             )
             self._handler.setFormatter(logging.Formatter("%(message)s"))
 
@@ -182,7 +190,8 @@ class AsyncJournal:
         try:
             directory.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=directory, prefix=".206-", suffix=".tmp", delete=False
+                mode="w", encoding="utf-8", errors="backslashreplace", dir=directory,
+                prefix=".206-", suffix=".tmp", delete=False
             ) as stream:
                 temporary = Path(stream.name)
                 json.dump(message, stream, ensure_ascii=False, allow_nan=False, indent=2)
@@ -218,15 +227,40 @@ class AsyncJournal:
         if self.result_dir is not None and entry.get("id") == 206 and entry.get("isFinal") is True:
             exported = self._export_final(entry, self.result_dir)
             entry = {**entry, "export": exported}
+            if exported["status"] not in ("saved", "already_saved"):
+                self.export_issue_count += 1
             if self.on_export is not None:
                 try:
                     self.on_export(entry["packetNo"], exported)
                 except Exception:
                     pass
+        if entry.get("kind") == "round_summary":
+            entry = {
+                **entry,
+                "journalDropped": self.dropped_count,
+                "journalFailures": self.failure_count,
+                "exportIssues": self.export_issue_count,
+                "evidenceComplete": entry["evidenceComplete"] and self._successful(),
+            }
         self._open()
         payload = json.dumps(entry, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         record = logging.LogRecord("vanta-listener", logging.INFO, "", 0, payload, (), None)
         self._handler.handle(record)
+        if entry.get("kind") == "round_summary" and self.summary_dir is not None:
+            self._write_summary(entry)
+
+    def _write_summary(self, entry: dict) -> None:
+        directory = self.summary_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"summary_{self.path.stem}_{entry['summaryNo']}.json"
+        temporary = target.with_suffix(".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", errors="backslashreplace") as stream:
+                json.dump(entry, stream, ensure_ascii=False, allow_nan=False, indent=2)
+                stream.write("\n")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _run(self) -> None:
         try:

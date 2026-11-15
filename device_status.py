@@ -7,7 +7,7 @@ import math
 from log_format import bounded_line, log_preview
 
 
-STATUS_NOTIFICATION_IDS = frozenset((100, 200, 201, 202, 203, 207, 209, 704))
+STATUS_NOTIFICATION_IDS = frozenset((100, 139, 200, 201, 202, 203, 207, 209, 701, 702, 704))
 SYSTEM_STATES = {
     "ready": "就绪",
     "x-rays off": "X 射线关闭",
@@ -21,7 +21,28 @@ STOP_REASONS = {
     "test complete": "检测完成",
     "complete": "检测完成",
     "time elapsed": "达到设定曝光时间",
+    "proximity failure": "Proximity Failure（接近报警）",
+    "user abort": "User Abort（用户中止）",
 }
+STOP_REASON_CLASS = {
+    "test complete": "complete",
+    "complete": "complete",
+    "proximity failure": "proximity",
+    "user abort": "stopped",
+}
+STOP_CODE_CLASS = {0: "complete", 2: "stopped", 6: "proximity"}
+
+
+def classify_stop(reason: str | None, code: int | None) -> str:
+    """Use the observed 201 reasons and reject disagreement between fields."""
+    label = reason.strip() if isinstance(reason, str) else reason
+    if label is None or label == "":
+        return STOP_CODE_CLASS.get(code, "unknown") if type(code) is int else "unknown"
+    name_class = STOP_REASON_CLASS.get(label.casefold(), "unknown") if isinstance(label, str) else "unknown"
+    if code is None:
+        return name_class
+    code_class = STOP_CODE_CLASS.get(code, "unknown") if type(code) is int else "unknown"
+    return name_class if name_class == code_class else "unknown"
 
 
 def _text(value, labels: dict[str, str]) -> str:
@@ -81,6 +102,16 @@ class DeviceStatus:
         if event == 209:
             self.phase = "设备报告检测错误"
             return f"检测错误 · {log_preview(params)}" if params else "检测错误"
+        if event == 139:
+            return f"数字 IO 变化 · {log_preview(params)}"
+        if event == 701:
+            messages = params.get("messages")
+            if isinstance(messages, list):
+                first = bounded_line(str(messages[0]))[:300] if messages else ""
+                return f"设备日志 {len(messages)} 行" + (f" · {first}" if first else "")
+            return f"设备日志 · {log_preview(params)}"
+        if event == 702:
+            return "设备报告 START / 触发"
         if event == 704:
             key = params.get("keyActivated")
             if type(key) is int and key in (6, 7):
