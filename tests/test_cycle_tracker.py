@@ -33,7 +33,8 @@ class CycleTrackerTests(unittest.TestCase):
         record, = self.closed
         self.assertEqual(record.outcome, Outcome.NORMAL)
         self.assertEqual(record.intermediate_206, 1)
-        self.assertEqual(record.to_entry()["t_201_to_final_ms"], -1000)
+        self.assertEqual((record.to_entry()["stopNs"], record.to_entry()["finalNs"]), (2 * NS, NS))
+        self.assertNotIn("t_201_to_final_ms", record.to_entry())
 
     def test_normal_final_after_stop(self):
         self.begin()
@@ -126,7 +127,7 @@ class CycleTrackerTests(unittest.TestCase):
         self.tracker.on_trigger(2, 4 * NS)
         self.tracker.on_api(704, {"keyActivated": 6}, 4 * NS + NS // 10)
         self.tracker.tick(9 * NS)
-        self.assertEqual([c.outcome for c in self.closed], [Outcome.NO_RESPONSE, Outcome.INCONCLUSIVE])
+        self.assertEqual([c.outcome for c in self.closed], [Outcome.NO_RESPONSE, Outcome.NO_START])
         self.assertTrue(self.closed[0].board_no_response)
 
     def test_no_response_needs_both_capture_sources(self):
@@ -220,16 +221,17 @@ class CycleTrackerTests(unittest.TestCase):
     def ordered(self, test_id, at, status, delta, key):
         self.tracker.on_result(ResultNotice(str(test_id), True, status, delta), at, result_key=key)
 
-    def test_id_jump_assigns_lost_result_to_earlier_cycle_while_both_wait(self):
-        # Usual device order: final 206 first, then 201. Cycle 2's final is lost
-        # and cycle 3's final arrives before cycle 2 reaches its deadline.
+    def test_keyed_result_matches_newer_cycle_while_earlier_waits(self):
         self.begin(1, 0)
         self.ordered(1, NS, "first", None, "k1")
         self.tracker.on_api(201, COMPLETE, 2 * NS)
         self.begin(2, 5 * NS)
+        self.result(2, 6 * NS, final=False, key="k2")
         self.tracker.on_api(201, COMPLETE, 8 * NS)
         self.begin(3, 10 * NS)
+        self.result(3, 10 * NS + NS // 2, final=False, key="k3")
         self.ordered(3, 11 * NS, "gap", 2, "k3")
+        self.assertFalse(any(c.outcome == Outcome.NO_RESULT for c in self.closed))
         self.tracker.on_api(201, COMPLETE, 12 * NS)
         self.tracker.tick(30 * NS)
         by_no = {c.no: c for c in self.closed}
@@ -238,11 +240,12 @@ class CycleTrackerTests(unittest.TestCase):
         self.assertEqual(by_no[3].test_id, "3")
         self.assertEqual(len(self.closed), 3)
 
-    def test_id_jump_claims_cycle_already_closed_as_no_result(self):
+    def test_id_jump_does_not_revise_prior_timeout(self):
         self.begin(1, 0)
         self.ordered(1, NS, "first", None, "k1")
         self.tracker.on_api(201, COMPLETE, 2 * NS)
         self.begin(2, 5 * NS)
+        self.result(2, 6 * NS, final=False, key="k2")
         self.tracker.on_api(201, COMPLETE, 8 * NS)
         self.tracker.tick(14 * NS)
         self.begin(3, 15 * NS)
@@ -252,21 +255,29 @@ class CycleTrackerTests(unittest.TestCase):
         self.assertEqual([by_no[n].outcome for n in (1, 2, 3)],
                          [Outcome.NORMAL, Outcome.NO_RESULT, Outcome.NORMAL])
         self.assertEqual(len(self.closed), 3)
-        self.assertTrue(by_no[2].id_accounted)
+    def test_late_abnormal_final_matches_its_own_identity(self):
+        self.begin(1)
+        self.result(11, NS // 2, final=False, key="abnormal")
+        self.tracker.on_api(201, PROXIMITY, NS)
+        self.begin(2, 2 * NS)
+        self.result(12, 2 * NS + NS // 2, final=False, key="normal")
+        self.ordered(11, 3 * NS, "consecutive", 1, "abnormal")
+        self.ordered(12, 4 * NS, "consecutive", 1, "normal")
+        self.tracker.on_api(201, COMPLETE, 5 * NS)
+        self.assertEqual([(c.outcome, c.test_id) for c in self.closed],
+                         [(Outcome.ABNORMAL_STOP, "11"), (Outcome.NORMAL, "12")])
 
-    def test_each_lost_cycle_is_claimed_once(self):
-        self.begin(1, 0)
+    def test_gap_packet_with_earlier_identity_does_not_mark_it_missing(self):
+        self.begin(1)
+        self.result(11, NS // 2, final=False, key="earlier")
         self.tracker.on_api(201, COMPLETE, NS)
-        self.begin(2, 3 * NS)
-        self.tracker.on_api(201, COMPLETE, 4 * NS)
-        self.begin(3, 6 * NS)
-        self.ordered(30, 7 * NS, "gap", 3, "k3")
-        self.tracker.on_api(201, COMPLETE, 8 * NS)
-        self.begin(4, 10 * NS)
-        self.ordered(31, 11 * NS, "consecutive", 1, "k4")
-        self.tracker.on_api(201, COMPLETE, 12 * NS)
-        self.assertEqual([c.outcome for c in sorted(self.closed, key=lambda c: c.no)],
-                         [Outcome.NO_RESULT, Outcome.NO_RESULT, Outcome.NORMAL, Outcome.NORMAL])
+        self.begin(2, 2 * NS)
+        self.result(12, 2 * NS + NS // 2, final=False, key="later")
+        self.ordered(11, 3 * NS, "gap", 2, "earlier")
+        self.ordered(12, 4 * NS, "consecutive", 1, "later")
+        self.tracker.on_api(201, COMPLETE, 5 * NS)
+        self.assertEqual([(c.outcome, c.test_id) for c in self.closed],
+                         [(Outcome.NORMAL, "11"), (Outcome.NORMAL, "12")])
 
     def test_id_jump_does_not_skip_cycle_without_stop(self):
         # A cycle that has not stopped yet cannot be judged lost.
@@ -275,17 +286,54 @@ class CycleTrackerTests(unittest.TestCase):
         self.ordered(5, 2 * NS, "gap", 2, "k5")
         self.assertFalse([c for c in self.closed if c.outcome is Outcome.NO_RESULT])
 
-    def test_proximity_cycle_is_not_counted_in_id_order(self):
+    def test_unknown_result_identity_stays_ambiguous_despite_id_order(self):
         self.begin(1, 0)
-        self.tracker.on_api(201, PROXIMITY, NS)
+        self.tracker.on_api(201, COMPLETE, NS)
         self.begin(2, 3 * NS)
-        self.ordered(7, 4 * NS, "consecutive", 1, "k7")
+        self.ordered(7, 4 * NS, "gap", 2, "k7")
         self.tracker.on_api(201, COMPLETE, 5 * NS)
         self.tracker.tick(10 * NS)
-        by_no = {c.no: c for c in self.closed}
-        self.assertEqual(by_no[1].outcome, Outcome.EMPTY_SHOT)
-        self.assertEqual(by_no[2].outcome, Outcome.NORMAL)
-        self.assertEqual(by_no[2].test_id, "7")
+        self.assertTrue(self.closed)
+        self.assertTrue(all(c.outcome == Outcome.INCONCLUSIVE for c in self.closed))
+
+    def test_api_only_device_trigger_without_start_is_reported_once(self):
+        self.tracker.on_disconnect(0, "arduino")
+        self.tracker.on_api(702, {}, NS)
+        self.tracker.on_api(704, {"keyActivated": 6}, NS)
+        self.tracker.on_api(704, {"keyActivated": 7}, NS + NS // 10)
+        self.tracker.tick(6 * NS)
+        record, = self.closed
+        self.assertEqual(record.outcome, Outcome.NO_START)
+        self.assertEqual(record.to_entry()["triggerSource"], "api")
+        self.assertEqual(self.tracker.triggers, 0)
+        self.assertEqual(self.tracker.api_triggers, 1)
+
+    def test_api_only_trigger_and_complete_final_pair(self):
+        self.tracker.on_disconnect(0, "arduino")
+        self.tracker.on_api(704, {"keyActivated": 6}, NS)
+        self.tracker.on_api(200, {}, NS + NS // 10)
+        self.tracker.on_api(201, COMPLETE, 2 * NS)
+        self.result(1, 3 * NS, key="one")
+        record, = self.closed
+        self.assertEqual(record.outcome, Outcome.NORMAL)
+        self.assertEqual(self.tracker.api_triggers, 1)
+
+    def test_api_only_separate_presses_remain_separate(self):
+        self.tracker.on_disconnect(0, "arduino")
+        self.tracker.on_api(704, {"keyActivated": 6}, NS)
+        self.tracker.on_api(704, {"keyActivated": 7}, NS + NS // 10)
+        self.tracker.on_api(704, {"keyActivated": 6}, 2 * NS)
+        self.tracker.tick(7 * NS)
+        self.assertEqual([c.outcome for c in self.closed], [Outcome.NO_START] * 2)
+        self.assertEqual(self.tracker.api_triggers, 2)
+
+    def test_result_error_prevents_normal_with_complete_stop(self):
+        self.begin()
+        self.tracker.on_result(ResultNotice("2014", True, result_error="statusId=-2998"), NS)
+        self.tracker.on_api(201, COMPLETE, 2 * NS)
+        record, = self.closed
+        self.assertEqual(record.outcome, Outcome.RESULT_ERROR)
+        self.assertEqual(record.to_entry()["resultError"], "statusId=-2998")
 
 
 if __name__ == "__main__":

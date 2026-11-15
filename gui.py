@@ -30,7 +30,7 @@ from transport import DemoClient, ListenerClient
 ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DEFAULT_IP = "169.254.90.208"
 DEFAULT_PORT = 7860
-DEFAULT_SERIAL_PORT = "COM4"
+APP_VERSION = "0.2.0-field.1"
 ARDUINO_STALE_NS = 4_000_000_000
 API_STALE_WITH_CYCLE_NS = 30_000_000_000
 MAX_PACKETS_PER_TICK = 25
@@ -78,18 +78,20 @@ CYCLE_LABELS = {
     "EMPTY_SHOT": "接近停测 · 无终态",
     "DOUBLE_START_STOP": "双 START 停测",
     "NO_RESPONSE": "未见设备响应",
+    "NO_START": "设备已见触发 · 未见启动",
     "NO_RESULT": "正常停测 · 未收终态",
     "ABNORMAL_STOP": "异常停测",
+    "RESULT_ERROR": "终态结果报错",
     "UNKNOWN_STOP": "未知停测",
-    "UNSOLICITED": "无对应板端触发",
+    "UNSOLICITED": "无对应触发记录",
     "INCONCLUSIVE": "无法判定",
 }
-CYCLE_ALERTS = frozenset(("NO_RESPONSE", "NO_RESULT", "ABNORMAL_STOP", "UNKNOWN_STOP", "INCONCLUSIVE"))
+CYCLE_ALERTS = frozenset(("NO_RESPONSE", "NO_START", "NO_RESULT", "ABNORMAL_STOP", "RESULT_ERROR",
+                         "UNKNOWN_STOP", "INCONCLUSIVE"))
 TIMING_FIELDS = (
     ("t_trigger_to_ack_ms", "trigger_ns", "ack_ns"),
     ("t_trigger_to_200_ms", "trigger_ns", "ev200_ns"),
     ("t_200_to_201_ms", "ev200_ns", "ev201_ns"),
-    ("t_201_to_final_ms", "ev201_ns", "final_206_ns"),
 )
 
 
@@ -197,7 +199,7 @@ class ListenerApp:
         )
         self.host = tk.StringVar(value=DEFAULT_IP)
         self.port = tk.StringVar(value=str(DEFAULT_PORT))
-        self.serial_port = tk.StringVar(value=DEFAULT_SERIAL_PORT)
+        self.serial_port = tk.StringVar()
         self.serial_command = tk.StringVar()
         self.result_count = tk.IntVar(value=0)
         self.mode = tk.StringVar(value="设备监听")
@@ -215,13 +217,15 @@ class ListenerApp:
         self.alert_count = tk.IntVar(value=0)
         self.cycle_summary = tk.StringVar()
         self._build()
+        self._submit_log({"kind": "app_started", "id": None, "appVersion": APP_VERSION,
+                          "received_at": stamp(self._round_start)})
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.window.bind("<Destroy>", self._on_destroy, add=True)
         self._poll_id = self.window.after(50, self._poll)
 
     def _build(self):
         w = self.window
-        w.title("Vanta iX 实时监控")
+        w.title(f"Vanta iX 实时监控 · {APP_VERSION}")
         w.geometry("1260x860")
         w.minsize(980, 700)
         w.configure(bg="#eef2f5")
@@ -249,7 +253,7 @@ class ListenerApp:
         tk.Label(header, text="最终结果数", bg="#15374a", fg="#dcecf0").pack(side="right")
         tk.Label(header, textvariable=self.alert_count, bg="#15374a", fg="#ffc7b4",
                  font=("Consolas", 22, "bold"), padx=12).pack(side="right")
-        tk.Label(header, text="待核查告警数", bg="#15374a", fg="#dcecf0").pack(side="right")
+        tk.Label(header, text="未见启动或终态", bg="#15374a", fg="#dcecf0").pack(side="right")
 
         body = ttk.Frame(w, padding=(18, 12))
         body.pack(fill="both", expand=True)
@@ -312,7 +316,7 @@ class ListenerApp:
         self.live_elements = chemistry_table(live_frame, height=5)
         self.monitor = PacketMonitor(views)
         views.add(self.monitor, text="206 报文")
-        self._build_cycle_page(views)
+        views.select(self._build_cycle_page(views))
         device_log_page = ttk.Frame(views, padding=6)
         views.add(device_log_page, text="设备日志")
         self.device_log = self._log_text(device_log_page)
@@ -397,17 +401,18 @@ class ListenerApp:
         self.cycle_count_label.pack(fill="x", pady=(0, 5))
         table = ttk.Frame(page)
         table.pack(fill="both", expand=True)
-        columns = ("cycle", "trigger", "id", "outcome", "stop", "start", "stop_ms", "final", "notes")
+        columns = ("cycle", "trigger", "id", "outcome", "stop", "start", "stop_ms", "notes")
         self.cycles = ttk.Treeview(table, columns=columns, show="headings", height=5)
         for key, title, width in zip(
             columns,
-            ("周期", "触发", "testID", "结果", "停测原因", "触发→200 ms", "200→201 ms", "201→206 ms", "备注"),
-            (45, 45, 55, 135, 130, 95, 95, 95, 245),
+            ("周期", "触发", "testID", "结果", "停测原因", "触发→200 ms", "200→201 ms", "备注"),
+            (45, 60, 55, 170, 130, 95, 95, 245),
         ):
             self.cycles.heading(key, text=title)
             self.cycles.column(key, width=width, minwidth=45)
         self.cycles.tag_configure("warning", background="#fff0e8", foreground="#97361f")
         scroll_table(table, self.cycles)
+        return page
 
     @staticmethod
     def _log_text(parent) -> tk.Text:
@@ -554,7 +559,8 @@ class ListenerApp:
             if value is not None:
                 values.append(value)
         outcome = entry["outcome"]
-        display = (cycle.no, cycle.trigger_no, cycle.test_id, CYCLE_LABELS.get(outcome, outcome), cycle.stop_reason,
+        trigger = "API" if entry["triggerSource"] == "api" else cycle.trigger_no
+        display = (cycle.no, trigger, cycle.test_id, CYCLE_LABELS.get(outcome, outcome), cycle.stop_reason,
                    *(entry.get(k) for k, _, _ in TIMING_FIELDS[1:]), " / ".join(cycle.notes))
         self.cycles.insert("", "end", values=tuple("—" if v is None else bounded_line(v) for v in display),
                            tags=("warning",) if outcome in CYCLE_ALERTS else ())
@@ -569,7 +575,8 @@ class ListenerApp:
             "kind": "round_summary", "id": None, "source": "app",
             "summaryNo": self._summary_no, "reason": reason, "start": stamp(self._round_start),
             "end": stamp(at), "received_at": stamp(at), "received_ns": ns,
-            "triggers": self.tracker.triggers, **counts, "TESTID_GAP": self._round_gap_alerts,
+            "appVersion": APP_VERSION, "triggers": self.tracker.triggers,
+            "apiTriggers": self.tracker.api_triggers, **counts, "TESTID_GAP": self._round_gap_alerts,
             "openCycles": len(self.tracker.open_cycles), "finalResults": self.result_count.get(),
             "disconnects": self._round_disconnects, "invalidPackets": self._round_invalid,
             "rxSequenceGaps": self._round_rx_gaps, "serialIssues": self._round_serial_issues,
@@ -783,6 +790,8 @@ class ListenerApp:
                 counted=counted,
                 resultCount=self.result_count.get(),
             )
+            if notice.result_error:
+                entry["resultError"] = notice.result_error
             test_id = notice.test_id or "—"
             if len(test_id) > 64:
                 test_id = test_id[:64] + "…"
@@ -982,10 +991,10 @@ class ListenerApp:
 
     def _refresh_audit(self, now_ns: int) -> None:
         counts = self.tracker.counts
-        missing = counts.get("NO_RESPONSE", 0) + counts.get("NO_RESULT", 0)
-        self.alert_count.set(missing + self._round_gap_alerts)
+        missing = sum(counts.get(key, 0) for key in ("NO_RESPONSE", "NO_START", "NO_RESULT"))
+        self.alert_count.set(missing)
         self.cycle_summary.set(" · ".join([
-            f"已发脉冲 {self.tracker.triggers}",
+            f"板端脉冲 {self.tracker.triggers}", f"API 独立触发 {self.tracker.api_triggers}",
             *(f"{label} {counts.get(key, 0)}" for key, label in CYCLE_LABELS.items()),
             f"跳号记录 {self._round_gap_alerts}", f"待结案 {len(self.tracker.open_cycles)}",
         ]))
@@ -1244,6 +1253,7 @@ class ListenerApp:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Vanta listener GUI")
+    parser.add_argument("--version", action="version", version=APP_VERSION)
     parser.add_argument("--connect", action="store_true", help="Connect when the GUI opens")
     parser.add_argument("--demo", action="store_true", help="Use local sample data")
     args = parser.parse_args()

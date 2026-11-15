@@ -28,6 +28,7 @@ class ResultNotice:
     daily_id_num: int | None = None
     daily_id_status: str | None = None
     daily_id_delta: int | None = None
+    result_error: str | None = None
 
 
 @dataclass
@@ -210,7 +211,8 @@ class ListenerModel:
             return "conflict", delta
 
         # A final result without a usable ID breaks the chain of comparisons.
-        self._last_final_number = number
+        if delta is None or delta >= 0:
+            self._last_final_number = number
         if number is None:
             status = "missing_id" if not test_id else "invalid_id"
         elif delta is None:
@@ -223,7 +225,7 @@ class ListenerModel:
             status = "backward"
         else:
             status = "repeated_id"
-        if number is not None:
+        if number is not None and (delta is None or delta >= 0):
             self._reconnected = False
         return status, delta
 
@@ -273,8 +275,15 @@ class ListenerModel:
         elements, issues = parse_elements(result)
         if not test_id:
             issues.append("缺少有效 testID。按结果内容去重。")
-        if analysis.get("testErrorInfo") not in (None, "", "No error", "No error "):
-            issues.append(f"设备结果信息 · {analysis['testErrorInfo']}")
+        error_text = analysis.get("testErrorInfo")
+        error_text = error_text.strip() if isinstance(error_text, str) else ""
+        error_code = analysis.get("statusId")
+        result_error = error_text if error_text.rstrip(".").casefold() not in ("", "no error") else None
+        if type(error_code) is int and error_code != 0:
+            code_label = f"statusId={error_code}"
+            result_error = f"{code_label} · {result_error}" if result_error else code_label
+        if result_error:
+            issues.append(f"设备结果信息 · {result_error}")
         if nonfinite:
             issues.append("报文含非有限数值（NaN/Infinity），已按字符串保存。")
         status, delta = self._check_test_id(test_id) if compare_test_ids else (None, None)
@@ -292,4 +301,4 @@ class ListenerModel:
         self._seen[key] = (fingerprint, record.seq)
         while len(self._seen) > self.max_seen:
             self._seen.popitem(last=False)
-        return ResultNotice(test_id, True, status, delta, daily, daily_status, daily_delta)
+        return ResultNotice(test_id, True, status, delta, daily, daily_status, daily_delta, result_error)

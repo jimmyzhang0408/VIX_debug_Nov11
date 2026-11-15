@@ -34,7 +34,16 @@ class ListenerModelTests(unittest.TestCase):
         self.assertEqual(self.send(2), ResultNotice("2", True, "duplicate"))
         self.assertEqual(self.send(6), ResultNotice("6", True, "gap", 4))
         self.assertEqual(self.send(4), ResultNotice("4", True, "backward", -2))
-        self.assertEqual(self.send("04"), ResultNotice("04", True, "repeated_id", 0))
+        self.assertEqual(self.send("06"), ResultNotice("06", True, "repeated_id", 0))
+        self.assertEqual(self.send(7), ResultNotice("7", True, "consecutive", 1))
+
+    def test_result_error_is_kept_on_a_final_result(self):
+        message = self.result(2014)
+        message["params"]["result"]["analysis"].update(
+            statusId=-2998, testErrorInfo="Exposure start failed. ")
+        notice = self.model.process(message, 100, self.at)
+        self.assertTrue(notice.is_final)
+        self.assertEqual(notice.result_error, "statusId=-2998 · Exposure start failed.")
 
     def test_reconnect_and_reset_have_different_effects(self):
         self.send(1)

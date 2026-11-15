@@ -24,7 +24,9 @@ class Outcome(str, Enum):
     EMPTY_SHOT = "EMPTY_SHOT"
     DOUBLE_START_STOP = "DOUBLE_START_STOP"
     ABNORMAL_STOP = "ABNORMAL_STOP"
+    RESULT_ERROR = "RESULT_ERROR"
     NO_RESPONSE = "NO_RESPONSE"
+    NO_START = "NO_START"
     NO_RESULT = "NO_RESULT"
     UNKNOWN_STOP = "UNKNOWN_STOP"
     UNSOLICITED = "UNSOLICITED"
@@ -57,6 +59,7 @@ class Cycle:
     ev209: list[dict] = field(default_factory=list)
     intermediate_206: int = 0
     final_206_ns: int | None = None
+    result_error: str | None = None
     test_id: str | None = None
     test_id_status: str | None = None
     result_key: str | None = None
@@ -64,7 +67,6 @@ class Cycle:
     board_no_response: bool = False
     board_rad_on: bool = False
     uncertain: bool = False
-    id_accounted: bool = False
     outcome: Outcome | None = None
     closed_ns: int | None = None
     notes: list[str] = field(default_factory=list)
@@ -86,16 +88,18 @@ class Cycle:
         return {
             "kind": "cycle", "id": None, "cycleNo": self.no, "triggerNo": self.trigger_no,
             "outcome": self.outcome.value if self.outcome is not None else None,
+            "triggerSource": ("arduino" if self.trigger_no is not None else
+                              "api" if self.trigger_ns is not None else None),
             "triggerNs": self.trigger_ns, "startNs": self.ev200_ns, "stopNs": self.ev201_ns,
             "finalNs": self.final_206_ns, "closedNs": self.closed_ns, "testID": self.test_id,
             "deviceTestTime": self.result_key, "testIDStatus": self.test_id_status,
+            "resultError": self.result_error,
             "readyDropNs": self.ready_drop_ns, "radOnNs": self.rad_on_ns, "radOffNs": self.rad_off_ns,
             "triggerReportedNs": self.ev702_ns, "startKeyNs": self.ev704_ns, "stopReason": self.stop_reason,
             "stopCode": self.stop_code, "stopClass": self.stop_class,
             "t_trigger_to_ack_ms": _elapsed_ms(self.trigger_ns, self.ack_ns),
             "t_trigger_to_200_ms": _elapsed_ms(self.trigger_ns, self.ev200_ns),
             "t_200_to_201_ms": _elapsed_ms(self.ev200_ns, self.ev201_ns),
-            "t_201_to_final_ms": _elapsed_ms(self.ev201_ns, self.final_206_ns),
             "intermediate206": self.intermediate_206, "ev209": list(self.ev209),
             "doubleSecond": self.double_second_ns is not None or self.second_key_ns is not None,
             "secondStartKeyNs": self.second_key_ns, "disconnected": self.disconnected,
@@ -111,6 +115,7 @@ class CycleTracker:
         self._on_close = on_close
         self.counts: Counter[Outcome] = Counter()
         self.triggers = 0
+        self.api_triggers = 0
         self.open_cycles: list[Cycle] = []
         self._sequence = 0
         self._capture: set[str] = set()
@@ -120,7 +125,6 @@ class CycleTracker:
         self._double_pending: Cycle | None = None
         self._second_candidate: Cycle | None = None
         self._endpoint: str | None = None
-        self._last_final_first_ns = -1
         # Keep recent identities to keep late packets out of newer cycles.
         self._closed: deque[Cycle] = deque(maxlen=128)
 
@@ -187,8 +191,8 @@ class CycleTracker:
         pending = self.finish_open(now_ns, "计数重置")
         self.counts.clear()
         self.triggers = 0
+        self.api_triggers = 0
         self._sequence = 0
-        self._last_final_first_ns = -1
         return pending
 
     def on_trigger(self, sent: int, now_ns: int) -> None:
@@ -266,7 +270,7 @@ class CycleTracker:
 
     def on_api(self, event_id: int, params: dict, now_ns: int) -> None:
         if event_id == 702:
-            self._ack("ev702_ns", now_ns)
+            self._record_device_trigger("ev702_ns", now_ns)
         elif event_id == 704:
             self._on_start_key(params.get("keyActivated"), now_ns)
         elif event_id == 200:
@@ -280,6 +284,25 @@ class CycleTracker:
             if active is not None:
                 active.ev209.append(params)
 
+    def _record_device_trigger(self, field_name: str, now_ns: int) -> None:
+        if "arduino" in self._capture or "api" not in self._capture:
+            self._ack(field_name, now_ns)
+            return
+        self.tick(now_ns)
+        if any(c.ev200_ns is not None and c.ev201_ns is None for c in self.open_cycles):
+            self._ack(field_name, now_ns)
+            return
+        other = "ev704_ns" if field_name == "ev702_ns" else "ev702_ns"
+        for cycle in reversed(self.open_cycles):
+            other_ns = getattr(cycle, other)
+            if (cycle.trigger_ns is not None and cycle.ev201_ns is None and other_ns is not None
+                    and getattr(cycle, field_name) is None and 0 <= now_ns - other_ns <= REORDER_WINDOW_NS):
+                setattr(cycle, field_name, now_ns)
+                return
+        cycle = self._new(now_ns, trigger=True)
+        setattr(cycle, field_name, now_ns)
+        self.api_triggers += 1
+
     def _on_start_key(self, key, now_ns: int) -> None:
         if key == 7:
             self._key_down = False
@@ -291,7 +314,7 @@ class CycleTracker:
                 active.second_key_ns = now_ns
             else:
                 self._pending_key_ns = now_ns
-                self._ack("ev704_ns", now_ns)
+                self._record_device_trigger("ev704_ns", now_ns)
 
     def _on_start(self, now_ns: int) -> None:
         candidates = [c for c in self.open_cycles if c.trigger_ns is not None
@@ -344,11 +367,7 @@ class CycleTracker:
         if notice.is_final is None:
             self.on_invalid(now_ns, "206 缺少有效的终态标记")
             return
-        cycle = None
-        if notice.is_final and not self._known_result(notice.test_id, result_key):
-            cycle = self._pick_by_id_order(notice, now_ns)
-        if cycle is None:
-            cycle = self._pick_result(notice.test_id, result_key, now_ns, notice.is_final)
+        cycle = self._pick_result(notice.test_id, result_key, now_ns)
         if cycle is None:
             if notice.is_final:
                 self._orphan_result(notice, result_key, now_ns)
@@ -362,8 +381,8 @@ class CycleTracker:
         cycle.result_key = result_key or cycle.result_key
         if notice.is_final:
             cycle.final_206_ns = now_ns
+            cycle.result_error = notice.result_error
             cycle.test_id_status = notice.id_status
-            self._last_final_first_ns = max(self._last_final_first_ns, cycle.first_ns)
             self._resolve(cycle, now_ns)
         else:
             cycle.intermediate_206 += 1
@@ -372,48 +391,7 @@ class CycleTracker:
         return bool(test_id) and any(c.test_id == test_id and (not key or c.result_key == key)
                                      for c in self._closed)
 
-    def _pick_by_id_order(self, notice: ResultNotice, now_ns: int) -> Cycle | None:
-        """Match a final 206 to a cycle by testID order.
-
-        Pulses that end in proximity or user-abort do not consume a testID, so
-        only cycles that can still produce a final result take part. A final
-        whose testID advanced by N means N-1 earlier result-bearing cycles never
-        delivered theirs: those are closed as NO_RESULT and the final goes to
-        the next one. Anything that cannot be explained this way is left to
-        the conservative matcher.
-        """
-        delta = notice.id_delta
-        if notice.id_status not in ("consecutive", "gap") or type(delta) is not int or delta < 1:
-            return None
-        started = sorted((c for c in self.open_cycles
-                          if c.first_ns <= now_ns and c.final_206_ns is None
-                          and (c.ev200_ns is not None or c.ev201_ns is not None)),
-                         key=lambda c: c.first_ns)
-        if any(c.stop_class == "unknown" for c in started):
-            return None
-        waiting = [c for c in started if c.stop_class in (None, "complete")]
-        lost = delta - 1
-        # Cycles already closed as NO_RESULT after the previous final may be
-        # the ones this jump accounts for. Each can be claimed only once.
-        closed = sorted((c for c in self._closed
-                         if c.outcome is Outcome.NO_RESULT and not c.id_accounted
-                         and c.final_206_ns is None and c.first_ns > self._last_final_first_ns),
-                        key=lambda c: c.first_ns)[:lost]
-        skipped = waiting[:lost - len(closed)]
-        if len(waiting) <= len(skipped) or any(c.ev201_ns is None for c in skipped):
-            return None
-        if lost == 0 and len(waiting) != 1:
-            return None
-        target = waiting[len(skipped)]
-        for cycle in closed:
-            cycle.id_accounted = True
-        for cycle in skipped:
-            cycle.id_accounted = True
-            self._close(cycle, Outcome.NO_RESULT, now_ns,
-                        f"后续最终 206 的 testID 前进 {delta}，该周期的最终 206 未收到")
-        return target
-
-    def _pick_result(self, test_id: str, key: str | None, now_ns: int, final: bool) -> Cycle | None:
+    def _pick_result(self, test_id: str, key: str | None, now_ns: int) -> Cycle | None:
         if self._known_result(test_id, key):
             return None
         candidates = [c for c in self.open_cycles if c.first_ns <= now_ns
@@ -429,15 +407,15 @@ class CycleTracker:
         # An unidentified earlier envelope can consume a final-only result from
         # a newer cycle. Its ambiguity survives closure during the late window.
         unresolved = any(c.ev200_ns is not None and c.final_206_ns is None
-                         and c.stop_class not in ("stopped", "proximity")
-                         and c.result_key is None and c.closed_ns is not None
+                         and (not c.test_id or not test_id or c.test_id == test_id)
+                         and (not c.result_key or not key)
+                         and c.closed_ns is not None
                          and 0 <= now_ns - c.closed_ns <= RESULT_TIMEOUT_NS
                          for c in self._closed)
         if unresolved and compatible:
             for c in compatible:
                 self._mark(c, "206 可能来自先前缺少结果标识的检测")
-            if final:
-                return None
+            return None
         return self._unique(compatible, "结果可能对应多个检测周期")
 
     def _orphan_result(self, notice: ResultNotice, key: str | None, now_ns: int) -> None:
@@ -446,10 +424,13 @@ class CycleTracker:
         cycle.test_id_status = notice.id_status
         cycle.result_key = key
         cycle.final_206_ns = now_ns
+        cycle.result_error = notice.result_error
         if self.open_cycles[:-1] or any(
                 c.result_key is not None and c.result_key == key and c.test_id == cycle.test_id
                 for c in self._closed):
             self._close(cycle, Outcome.INCONCLUSIVE, now_ns, "无法将最终 206 与检测周期唯一关联")
+        elif cycle.result_error:
+            self._close(cycle, Outcome.RESULT_ERROR, now_ns, cycle.result_error)
         else:
             self._close(cycle, Outcome.UNSOLICITED, now_ns, "最终 206 无对应的 200 或板端触发")
 
@@ -458,8 +439,11 @@ class CycleTracker:
         if stop_ns is not None:
             if cycle.stop_class == "complete":
                 if cycle.final_206_ns is not None:
-                    outcome = Outcome.UNSOLICITED if cycle.unsolicited else Outcome.NORMAL
-                    self._close(cycle, outcome, now_ns)
+                    if cycle.result_error:
+                        self._close(cycle, Outcome.RESULT_ERROR, now_ns, cycle.result_error)
+                    else:
+                        outcome = Outcome.UNSOLICITED if cycle.unsolicited else Outcome.NORMAL
+                        self._close(cycle, outcome, now_ns)
                 elif now_ns - stop_ns >= RESULT_TIMEOUT_NS:
                     self._close(cycle, Outcome.NO_RESULT, now_ns, "正常 201 后未在等待时间内收到最终 206")
             elif cycle.final_206_ns is not None or now_ns - stop_ns >= ABORT_GRACE_NS:
@@ -471,7 +455,12 @@ class CycleTracker:
             elapsed = now_ns - cycle.trigger_ns
             acknowledged = cycle.ack_ns is not None or cycle.board_rad_on
             if acknowledged and elapsed >= START_TIMEOUT_NS:
-                self._close(cycle, Outcome.INCONCLUSIVE, now_ns, "观察到响应信号，但未收到 200")
+                seen_start = cycle.ev702_ns is not None or cycle.ev704_ns is not None
+                exposure = cycle.activity_ns is not None or cycle.rad_on_ns is not None or cycle.board_rad_on
+                if seen_start and not exposure:
+                    self._close(cycle, Outcome.NO_START, now_ns, "设备报告 START，未见 200 或曝光")
+                else:
+                    self._close(cycle, Outcome.INCONCLUSIVE, now_ns, "观察到响应信号，但未收到 200")
             elif not acknowledged and elapsed >= ACK_TIMEOUT_NS:
                 if {"api", "arduino"} <= self._capture:
                     self._close(cycle, Outcome.NO_RESPONSE, now_ns, "未观察到启动通知或 GPIO 响应")
