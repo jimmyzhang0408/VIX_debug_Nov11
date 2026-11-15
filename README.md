@@ -18,6 +18,10 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe app.py --demo
 ```
 
+## Arduino 固件与接线
+
+DEMO 台架使用 Arduino UNO R4 WiFi。固件和五根线的接线表在同一目录。先阅读接线条件，再连接设备。 [固件与接线说明](arduino/Vanta_iX_PLC_Direct_5V/README.md)
+
 ## 构建目录式 EXE
 
 ```powershell
